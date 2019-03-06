@@ -26,14 +26,12 @@ using System.Threading.Tasks;
 namespace FluentFTP {
 
 	/// <summary>
-	/// FTP Control Connection. Speaks the FTP protocol with the server and
+	/// FTP Control Connection. Speaks the FTP/FTPS protocol with the server and
 	/// provides facilities for performing transactions.
 	/// 
 	/// Debugging problems with FTP transactions is much easier to do when
-	/// you can see exactly what is sent to the server and the reply 
-	/// FluentFTP gets in return. Please review the Debug example
-	/// below for information on how to add <see cref="System.Diagnostics.TraceListener"/>s for capturing
-	/// the conversation between FluentFTP and the server.
+	/// you can see the commands exchanged between FluentFTP and the FTP Server.
+	/// Please read the FAQ on our Github project page to see how to enable logging.
 	/// </summary>
 	/// <example>The following example illustrates how to assist in debugging
 	/// FluentFTP by getting a transaction log from the server.
@@ -212,6 +210,21 @@ namespace FluentFTP {
 			}
 			set {
 				m_threadSafeDataChannels = value;
+			}
+		}
+
+		bool m_checkCapabilities = true;
+		/// <summary>
+		/// When this value is set to true (default) the control connection
+		/// will set which features are avaiable by executing the FEAT command
+		/// when the connect method is called.
+		/// </summary>
+		public bool CheckCapabilities {
+			get {
+				return m_checkCapabilities;
+			}
+			set {
+				m_checkCapabilities = value;
 			}
 		}
 
@@ -607,12 +620,31 @@ namespace FluentFTP {
 
 		private string m_systemType = "UNKNOWN";
 		/// <summary>
-		/// Gets the type of system/server that we're
-		/// connected to.
+		/// Gets the type of system/server that we're connected to. Typically begins with "WINDOWS" or "UNIX".
 		/// </summary>
 		public string SystemType {
 			get {
 				return m_systemType;
+			}
+		}
+
+		private FtpServer m_serverType = FtpServer.Unknown;
+		/// <summary>
+		/// Gets the type of the FTP server software that we're connected to.
+		/// </summary>
+		public FtpServer ServerType {
+			get {
+				return m_serverType;
+			}
+		}
+
+		private FtpOperatingSystem m_serverOS = FtpOperatingSystem.Unknown;
+		/// <summary>
+		/// Gets the operating system of the FTP server that we're connected to.
+		/// </summary>
+		public FtpOperatingSystem ServerOS {
+			get {
+				return m_serverOS;
 			}
 		}
 
@@ -621,6 +653,13 @@ namespace FluentFTP {
 		public string ConnectionType {
 			get { return m_connectionType; }
 			protected set { m_connectionType = value; }
+		}
+
+		private FtpReply m_lastReply;
+		/// <summary> Gets the last reply recieved from the server</summary>
+		public FtpReply LastReply {
+			get { return m_lastReply; }
+			protected set { m_lastReply = value; }
 		}
 
 		#endregion
@@ -692,29 +731,29 @@ namespace FluentFTP {
 		/// Disconnects from the server, releases resources held by this
 		/// object.
 		/// </summary>
-		public void Dispose() {
+		public virtual void Dispose() {
 #if !CORE14
 			lock (m_lock) {
 #endif
 				if (IsDisposed)
 					return;
 
-				FtpTrace.WriteFunc("Dispose");
-				FtpTrace.WriteStatus(FtpTraceLevel.Verbose, "Disposing FtpClient object...");
+				this.LogFunc("Dispose");
+				this.LogStatus(FtpTraceLevel.Verbose, "Disposing FtpClient object...");
 
 				try {
 					if (IsConnected) {
 						Disconnect();
 					}
 				} catch (Exception ex) {
-					FtpTrace.WriteLine(FtpTraceLevel.Warn, "FtpClient.Dispose(): Caught and discarded an exception while disconnecting from host: " + ex.ToString());
+					this.LogLine(FtpTraceLevel.Warn, "FtpClient.Dispose(): Caught and discarded an exception while disconnecting from host: " + ex.ToString());
 				}
 
 				if (m_stream != null) {
 					try {
 						m_stream.Dispose();
 					} catch (Exception ex) {
-						FtpTrace.WriteLine(FtpTraceLevel.Warn, "FtpClient.Dispose(): Caught and discarded an exception while disposing FtpStream object: " + ex.ToString());
+						this.LogLine(FtpTraceLevel.Warn, "FtpClient.Dispose(): Caught and discarded an exception while disposing FtpStream object: " + ex.ToString());
 					} finally {
 						m_stream = null;
 					}
@@ -781,9 +820,9 @@ namespace FluentFTP {
 			conn.RetryAttempts = RetryAttempts;
 			conn.UploadRateLimit = UploadRateLimit;
 			conn.DownloadRateLimit = DownloadRateLimit;
-			conn.RecursiveList = RecursiveList;
 			conn.DownloadDataType = DownloadDataType;
 			conn.UploadDataType = UploadDataType;
+			conn.ActivePorts = ActivePorts;
 #if !CORE
 			conn.PlainTextEncryption = PlainTextEncryption;
 #endif
@@ -830,7 +869,7 @@ namespace FluentFTP {
 
 				if (!IsConnected) {
 					if (command == "QUIT") {
-						FtpTrace.WriteStatus(FtpTraceLevel.Info, "Not sending QUIT because the connection has already been closed.");
+						this.LogStatus(FtpTraceLevel.Info, "Not sending QUIT because the connection has already been closed.");
 						return new FtpReply() {
 							Code = "200",
 							Message = "Connection already closed."
@@ -848,7 +887,7 @@ namespace FluentFTP {
 				if (!FtpTrace.LogPassword && command.StartsWith("PASS", StringComparison.Ordinal)) {
 					commandTxt = "PASS ***";
 				}
-				FtpTrace.WriteLine(FtpTraceLevel.Info, "Command:  " + commandTxt);
+				this.LogLine(FtpTraceLevel.Info, "Command:  " + commandTxt);
 
 				// send command to FTP server
 				m_stream.WriteLine(m_textEncoding, command);
@@ -875,8 +914,8 @@ namespace FluentFTP {
 			AsyncExecute func;
 			IAsyncResult ar;
 
-			ar = (func = new AsyncExecute(Execute)).BeginInvoke(command, callback, state);
 			lock (m_asyncmethods) {
+				ar = (func = new AsyncExecute(Execute)).BeginInvoke(command, callback, state);
 				m_asyncmethods.Add(ar, func);
 			}
 
@@ -895,19 +934,19 @@ namespace FluentFTP {
 #endif
 
 #if ASYNC
-        // TODO: Add cencellation support
 		/// <summary>
 		/// Performs an asynchronous execution of the specified command
 		/// </summary>
 		/// <param name="command">The command to execute</param>
+		/// <param name="token">Cancellation Token</param>
 		/// <returns>The servers reply to the command</returns>
-		public async Task<FtpReply> ExecuteAsync(string command) {
+		public async Task<FtpReply> ExecuteAsync(string command, CancellationToken token) {
             FtpReply reply;
 
             if (StaleDataCheck)
             {
 #if CORE
-                await ReadStaleDataAsync(true, false, true);
+                await ReadStaleDataAsync(true, false, true, token);
 #else
                 ReadStaleData(true, false, true);
 #endif
@@ -917,7 +956,7 @@ namespace FluentFTP {
             {
                 if (command == "QUIT")
                 {
-                    FtpTrace.WriteStatus(FtpTraceLevel.Info, "Not sending QUIT because the connection has already been closed.");
+                    this.LogStatus(FtpTraceLevel.Info, "Not sending QUIT because the connection has already been closed.");
                     return new FtpReply()
                     {
                         Code = "200",
@@ -925,7 +964,7 @@ namespace FluentFTP {
                     };
                 }
 
-                await ConnectAsync();
+                await ConnectAsync(token);
             }
 
             // hide sensitive data from logs
@@ -938,11 +977,11 @@ namespace FluentFTP {
             {
                 commandTxt = "PASS ***";
             }
-            FtpTrace.WriteLine(FtpTraceLevel.Info, "Command:  " + commandTxt);
+            this.LogLine(FtpTraceLevel.Info, "Command:  " + commandTxt);
 
             // send command to FTP server
-            await m_stream.WriteLineAsync(m_textEncoding, command);
-            reply = await GetReplyAsync();
+            await m_stream.WriteLineAsync(m_textEncoding, command, token);
+            reply = await GetReplyAsync(token);
 
             return reply;
         }
@@ -994,7 +1033,7 @@ namespace FluentFTP {
 					}
 
 					// log response code + message
-					FtpTrace.WriteLine(FtpTraceLevel.Info, "Response: " + reply.Code + " " + logMsg);
+					this.LogLine(FtpTraceLevel.Info, "Response: " + reply.Code + " " + logMsg);
 				}
 
 				// log multiline response messages
@@ -1002,13 +1041,14 @@ namespace FluentFTP {
 					reply.InfoMessages = reply.InfoMessages.Trim();
 				}
 				if (!string.IsNullOrEmpty(reply.InfoMessages)) {
-					//FtpTrace.WriteLine(FtpTraceLevel.Verbose, "+---------------------------------------+");
-					FtpTrace.WriteLine(FtpTraceLevel.Verbose, reply.InfoMessages.Split('\n').AddPrefix("Response: ", true).Join("\n"));
-					//FtpTrace.WriteLine(FtpTraceLevel.Verbose, "-----------------------------------------");
+					//this.LogLine(FtpTraceLevel.Verbose, "+---------------------------------------+");
+					this.LogLine(FtpTraceLevel.Verbose, reply.InfoMessages.Split('\n').AddPrefix("Response: ", true).Join("\n"));
+					//this.LogLine(FtpTraceLevel.Verbose, "-----------------------------------------");
 				}
 #if !CORE14
 			}
 #endif
+			LastReply = reply;
 
 			return reply;
 		}
@@ -1023,7 +1063,7 @@ namespace FluentFTP {
         /// </summary>
         /// <returns>FtpReply representing the response from the server</returns>
         /// <example><code source="..\Examples\BeginGetReply.cs" lang="cs" /></example>
-        public async Task<FtpReply> GetReplyAsync()
+        public async Task<FtpReply> GetReplyAsync(CancellationToken token)
         {
             FtpReply reply = new FtpReply();
             string buf;
@@ -1032,7 +1072,7 @@ namespace FluentFTP {
                 throw new InvalidOperationException("No connection to the server has been established.");
 
             m_stream.ReadTimeout = m_readTimeout;
-            while ((buf = await m_stream.ReadLineAsync(Encoding)) != null)
+            while ((buf = await m_stream.ReadLineAsync(Encoding, token)) != null)
             {
                 Match m;
 
@@ -1059,7 +1099,7 @@ namespace FluentFTP {
                 }
 
                 // log response code + message
-                FtpTrace.WriteLine(FtpTraceLevel.Info, "Response: " + reply.Code + " " + logMsg);
+                this.LogLine(FtpTraceLevel.Info, "Response: " + reply.Code + " " + logMsg);
             }
 
             // log multiline response messages
@@ -1069,9 +1109,9 @@ namespace FluentFTP {
             }
             if (!string.IsNullOrEmpty(reply.InfoMessages))
             {
-                //FtpTrace.WriteLine(FtpTraceLevel.Verbose, "+---------------------------------------+");
-                FtpTrace.WriteLine(FtpTraceLevel.Verbose, reply.InfoMessages.Split('\n').AddPrefix("Response: ", true).Join("\n"));
-                //FtpTrace.WriteLine(FtpTraceLevel.Verbose, "-----------------------------------------");
+                //this.LogLine(FtpTraceLevel.Verbose, "+---------------------------------------+");
+                this.LogLine(FtpTraceLevel.Verbose, reply.InfoMessages.Split('\n').AddPrefix("Response: ", true).Join("\n"));
+                //this.LogLine(FtpTraceLevel.Verbose, "-----------------------------------------");
             }
 
             return reply;
@@ -1096,13 +1136,14 @@ namespace FluentFTP {
 			lock (m_lock) {
 #endif
 
-				FtpTrace.WriteFunc("Connect");
+				this.LogFunc("Connect");
 
 				if (IsDisposed)
 					throw new ObjectDisposedException("This FtpClient object has been disposed. It is no longer accessible.");
 
 				if (m_stream == null) {
 					m_stream = new FtpSocketStream(m_SslProtocols);
+					m_stream.Client = this;
 					m_stream.ValidateCertificate += new FtpSocketStreamSslValidation(FireValidateCertficate);
 				} else {
 					if (IsConnected) {
@@ -1132,6 +1173,7 @@ namespace FluentFTP {
 #endif
 
 				Handshake();
+				DetectFtpServer();
 
 #if !NO_SSL
 				if (EncryptionMode == FtpEncryptionMode.Explicit) {
@@ -1155,9 +1197,11 @@ namespace FluentFTP {
 
 				// if this is a clone these values should have already been loaded
 				// so save some bandwidth and CPU time and skip executing this again.
-				if (!IsClone) {
+				if (!IsClone && m_checkCapabilities) {
 					if ((reply = Execute("FEAT")).Success && reply.InfoMessages != null) {
 						GetFeatures(reply);
+					} else {
+						AssumeCapabilities();
 					}
 				}
 
@@ -1166,7 +1210,7 @@ namespace FluentFTP {
 					m_textEncoding = Encoding.UTF8;
 				}
 
-				FtpTrace.WriteStatus(FtpTraceLevel.Info, "Text encoding: " + m_textEncoding.ToString());
+				this.LogStatus(FtpTraceLevel.Info, "Text encoding: " + m_textEncoding.ToString());
 
 				if (m_textEncoding == Encoding.UTF8) {
 					// If the server supports UTF8 it should already be enabled and this
@@ -1178,6 +1222,7 @@ namespace FluentFTP {
 				// Get the system type - Needed to auto-detect file listing parser
 				if ((reply = Execute("SYST")).Success) {
 					m_systemType = reply.Message;
+					DetectFtpServerBySyst();
 				}
 
 #if !NO_SSL && !CORE
@@ -1198,6 +1243,9 @@ namespace FluentFTP {
 				// Create the parser even if the auto-OS detection failed
 				m_listParser.Init(m_systemType);
 
+				// FIX : #318 always set the type when we create a new connection
+				ForceSetDataType = true;
+
 #if !CORE14
 			}
 #endif
@@ -1210,11 +1258,11 @@ namespace FluentFTP {
         /// </summary>
         /// <exception cref="ObjectDisposedException">Thrown if this object has been disposed.</exception>
         /// <example><code source="..\Examples\Connect.cs" lang="cs" /></example>
-        public virtual async Task ConnectAsync()
+        public virtual async Task ConnectAsync(CancellationToken token = default(CancellationToken))
         {
             FtpReply reply;
 
-            FtpTrace.WriteFunc(nameof(ConnectAsync));
+            this.LogFunc(nameof(ConnectAsync));
 
             if (IsDisposed)
                 throw new ObjectDisposedException("This FtpClient object has been disposed. It is no longer accessible.");
@@ -1222,6 +1270,7 @@ namespace FluentFTP {
             if (m_stream == null)
             {
                 m_stream = new FtpSocketStream(m_SslProtocols);
+				m_stream.Client = this;
                 m_stream.ValidateCertificate += new FtpSocketStreamSslValidation(FireValidateCertficate);
             }
             else
@@ -1245,7 +1294,7 @@ namespace FluentFTP {
             m_hashAlgorithms = FtpHashAlgorithm.NONE;
             m_stream.ConnectTimeout = m_connectTimeout;
             m_stream.SocketPollInterval = m_socketPollInterval;
-            await ConnectAsync(m_stream);
+            await ConnectAsync(m_stream, token);
 
             m_stream.SetSocketOption(System.Net.Sockets.SocketOptionLevel.Socket, System.Net.Sockets.SocketOptionName.KeepAlive, m_keepAlive);
 
@@ -1255,38 +1304,40 @@ namespace FluentFTP {
             }
 #endif
 
-            await HandshakeAsync();
+            await HandshakeAsync(token);
+			DetectFtpServer();
 
 #if !NO_SSL
             if (EncryptionMode == FtpEncryptionMode.Explicit) {
-                if (!(reply = await ExecuteAsync("AUTH TLS")).Success) {
+                if (!(reply = await ExecuteAsync("AUTH TLS", token)).Success) {
                     throw new FtpSecurityNotAvailableException("AUTH TLS command failed.");
                 }
                 await m_stream.ActivateEncryptionAsync(Host, m_clientCerts.Count > 0 ? m_clientCerts : null, m_SslProtocols);
             }
 #endif
 
-            if (m_credentials != null)
+			if (m_credentials != null)
             {
-                await AuthenticateAsync();
+                await AuthenticateAsync(token);
             }
 
             if (m_stream.IsEncrypted && DataConnectionEncryption)
             {
-                if (!(reply = await ExecuteAsync("PBSZ 0")).Success)
+                if (!(reply = await ExecuteAsync("PBSZ 0", token)).Success)
                     throw new FtpCommandException(reply);
-                if (!(reply = await ExecuteAsync("PROT P")).Success)
+                if (!(reply = await ExecuteAsync("PROT P", token)).Success)
                     throw new FtpCommandException(reply);
             }
 
-            // if this is a clone these values should have already been loaded
-            // so save some bandwidth and CPU time and skip executing this again.
-            if (!IsClone)
-            {
-                if ((reply = await ExecuteAsync("FEAT")).Success && reply.InfoMessages != null)
+			// if this is a clone these values should have already been loaded
+			// so save some bandwidth and CPU time and skip executing this again.
+			if (!IsClone && m_checkCapabilities) {
+				if ((reply = await ExecuteAsync("FEAT", token)).Success && reply.InfoMessages != null)
                 {
                     GetFeatures(reply);
-                }
+                }else {
+						AssumeCapabilities();
+				}
             }
 
             // Enable UTF8 if the encoding is ASCII and UTF8 is supported
@@ -1295,25 +1346,26 @@ namespace FluentFTP {
                 m_textEncoding = Encoding.UTF8;
             }
 
-            FtpTrace.WriteStatus(FtpTraceLevel.Info, "Text encoding: " + m_textEncoding.ToString());
+            this.LogStatus(FtpTraceLevel.Info, "Text encoding: " + m_textEncoding.ToString());
 
             if (m_textEncoding == Encoding.UTF8)
             {
                 // If the server supports UTF8 it should already be enabled and this
                 // command should not matter however there are conflicting drafts
                 // about this so we'll just execute it to be safe. 
-                await ExecuteAsync("OPTS UTF8 ON");
+                await ExecuteAsync("OPTS UTF8 ON", token);
             }
 
             // Get the system type - Needed to auto-detect file listing parser
-            if ((reply = await ExecuteAsync("SYST")).Success)
+            if ((reply = await ExecuteAsync("SYST", token)).Success)
             {
                 m_systemType = reply.Message;
+				DetectFtpServerBySyst();
             }
 
 #if !NO_SSL && !CORE
             if (m_stream.IsEncrypted && PlainTextEncryption) {
-                if (!(reply = await ExecuteAsync("CCC")).Success)
+                if (!(reply = await ExecuteAsync("CCC", token)).Success)
                 {
                     throw new FtpSecurityNotAvailableException("Failed to disable encryption with CCC command. Perhaps your server does not support it or is not configured to allow it.");
                 } else {
@@ -1322,13 +1374,13 @@ namespace FluentFTP {
                     m_stream.DeactivateEncryption();
 
                     // read stale data (server's reply?)
-                    await ReadStaleDataAsync(false, true, false);
+                    await ReadStaleDataAsync(false, true, false, token);
                 }
             }
 #endif
 
-            // Create the parser even if the auto-OS detection failed
-            m_listParser.Init(m_systemType);
+			// Create the parser even if the auto-OS detection failed
+			m_listParser.Init(m_systemType);
         }
 #endif
 
@@ -1341,13 +1393,14 @@ namespace FluentFTP {
 		}
 
 #if ASYNC
-        /// <summary>
-        /// Connect to the FTP server. Overwritten in proxy classes.
-        /// </summary>
-        /// <param name="stream"></param>
-        protected virtual async Task ConnectAsync(FtpSocketStream stream)
+		/// <summary>
+		/// Connect to the FTP server. Overwritten in proxy classes.
+		/// </summary>
+		/// <param name="stream"></param>
+		/// <param name="token"></param>
+		protected virtual async Task ConnectAsync(FtpSocketStream stream, CancellationToken token)
         {
-            await stream.ConnectAsync(Host, Port, InternetProtocolVersions);
+            await stream.ConnectAsync(Host, Port, InternetProtocolVersions, token);
         }
 #endif
 
@@ -1362,11 +1415,13 @@ namespace FluentFTP {
         /// <summary>
         /// Connect to the FTP server. Overwritten in proxy classes.
         /// </summary>
-        protected virtual Task ConnectAsync(FtpSocketStream stream, string host, int port, FtpIpVersion ipVersions)
+        protected virtual Task ConnectAsync(FtpSocketStream stream, string host, int port, FtpIpVersion ipVersions, CancellationToken token)
         {
-            return stream.ConnectAsync(host, port, ipVersions);
+            return stream.ConnectAsync(host, port, ipVersions, token);
         }
 #endif
+
+		protected FtpReply HandshakeReply;
 
 		/// <summary>
 		/// Called during Connect(). Typically extended by FTP proxies.
@@ -1380,16 +1435,17 @@ namespace FluentFTP {
 					throw new FtpCommandException(reply);
 				}
 			}
+			HandshakeReply = reply;
 		}
 
 #if ASYNC
         /// <summary>
         /// Called during <see cref="ConnectAsync()"/>. Typically extended by FTP proxies.
         /// </summary>
-        protected virtual async Task HandshakeAsync()
+        protected virtual async Task HandshakeAsync(CancellationToken token = default(CancellationToken))
         {
             FtpReply reply;
-            if (!(reply = await GetReplyAsync()).Success)
+            if (!(reply = await GetReplyAsync(token)).Success)
             {
                 if (reply.Code == null)
                 {
@@ -1400,6 +1456,7 @@ namespace FluentFTP {
                     throw new FtpCommandException(reply);
                 }
             }
+			HandshakeReply = reply;
         }
 #endif
 
@@ -1411,43 +1468,53 @@ namespace FluentFTP {
 		/// <param name="reply">The reply object from the FEAT command. The InfoMessages property will
 		/// contain a list of the features the server supported delimited by a new line '\n' character.</param>
 		protected virtual void GetFeatures(FtpReply reply) {
-			foreach (string feat in reply.InfoMessages.Split('\n')) {
-				if (feat.ToUpper().Trim().StartsWith("MLST") || feat.ToUpper().Trim().StartsWith("MLSD"))
+			GetFeatures(reply.InfoMessages.Split('\n'));
+		}
+
+		/// <summary>
+		/// Populates the capabilities flags based on capabilities given in the list of strings.
+		/// </summary>
+		protected virtual void GetFeatures(string[] features) {
+			foreach (string feat in features) {
+
+				string featName = feat.Trim().ToUpper();
+
+				if (featName.StartsWith("MLST") || featName.StartsWith("MLSD"))
 					m_caps |= FtpCapability.MLSD;
-				else if (feat.ToUpper().Trim().StartsWith("MDTM"))
+				else if (featName.StartsWith("MDTM"))
 					m_caps |= FtpCapability.MDTM;
-				else if (feat.ToUpper().Trim().StartsWith("REST STREAM"))
+				else if (featName.StartsWith("REST STREAM"))
 					m_caps |= FtpCapability.REST;
-				else if (feat.ToUpper().Trim().StartsWith("SIZE"))
+				else if (featName.StartsWith("SIZE"))
 					m_caps |= FtpCapability.SIZE;
-				else if (feat.ToUpper().Trim().StartsWith("UTF8"))
+				else if (featName.StartsWith("UTF8"))
 					m_caps |= FtpCapability.UTF8;
-				else if (feat.ToUpper().Trim().StartsWith("PRET"))
+				else if (featName.StartsWith("PRET"))
 					m_caps |= FtpCapability.PRET;
-				else if (feat.ToUpper().Trim().StartsWith("MFMT"))
+				else if (featName.StartsWith("MFMT"))
 					m_caps |= FtpCapability.MFMT;
-				else if (feat.ToUpper().Trim().StartsWith("MFCT"))
+				else if (featName.StartsWith("MFCT"))
 					m_caps |= FtpCapability.MFCT;
-				else if (feat.ToUpper().Trim().StartsWith("MFF"))
+				else if (featName.StartsWith("MFF"))
 					m_caps |= FtpCapability.MFF;
-				else if (feat.ToUpper().Trim().StartsWith("MD5"))
+				else if (featName.StartsWith("MD5"))
 					m_caps |= FtpCapability.MD5;
-				else if (feat.ToUpper().Trim().StartsWith("XMD5"))
+				else if (featName.StartsWith("XMD5"))
 					m_caps |= FtpCapability.XMD5;
-				else if (feat.ToUpper().Trim().StartsWith("XCRC"))
+				else if (featName.StartsWith("XCRC"))
 					m_caps |= FtpCapability.XCRC;
-				else if (feat.ToUpper().Trim().StartsWith("XSHA1"))
+				else if (featName.StartsWith("XSHA1"))
 					m_caps |= FtpCapability.XSHA1;
-				else if (feat.ToUpper().Trim().StartsWith("XSHA256"))
+				else if (featName.StartsWith("XSHA256"))
 					m_caps |= FtpCapability.XSHA256;
-				else if (feat.ToUpper().Trim().StartsWith("XSHA512"))
+				else if (featName.StartsWith("XSHA512"))
 					m_caps |= FtpCapability.XSHA512;
-				else if (feat.ToUpper().Trim().StartsWith("HASH")) {
+				else if (featName.StartsWith("HASH")) {
 					Match m;
 
 					m_caps |= FtpCapability.HASH;
 
-					if ((m = Regex.Match(feat.ToUpper().Trim(), @"^HASH\s+(?<types>.*)$")).Success) {
+					if ((m = Regex.Match(featName, @"^HASH\s+(?<types>.*)$")).Success) {
 						foreach (string type in m.Groups["types"].Value.Split(';')) {
 							switch (type.ToUpper().Trim()) {
 								case "SHA-1":
@@ -1491,9 +1558,8 @@ namespace FluentFTP {
 			AsyncConnect func;
 			IAsyncResult ar;
 
-			ar = (func = new AsyncConnect(Connect)).BeginInvoke(callback, state);
-
 			lock (m_asyncmethods) {
+				ar = (func = new AsyncConnect(Connect)).BeginInvoke(callback, state);
 				m_asyncmethods.Add(ar, func);
 			}
 
@@ -1511,7 +1577,7 @@ namespace FluentFTP {
 #endif
 
 		#endregion
-
+		
 		#region Login
 
 		/// <summary>
@@ -1529,9 +1595,9 @@ namespace FluentFTP {
         /// that the login procedure can be changed to support, for example,
         /// a FTP proxy.
         /// </summary>
-        protected virtual async Task AuthenticateAsync()
+        protected virtual async Task AuthenticateAsync(CancellationToken token)
         {
-            await AuthenticateAsync(Credentials.UserName, Credentials.Password);
+            await AuthenticateAsync(Credentials.UserName, Credentials.Password, token);
         }
 #endif
 
@@ -1557,15 +1623,15 @@ namespace FluentFTP {
         /// that the login procedure can be changed to support, for example,
         /// a FTP proxy.
         /// </summary>
-        protected virtual async Task AuthenticateAsync(string userName, string password)
+        protected virtual async Task AuthenticateAsync(string userName, string password, CancellationToken token)
         {
             FtpReply reply;
 
-            if (!(reply = await ExecuteAsync("USER " + userName)).Success)
+            if (!(reply = await ExecuteAsync("USER " + userName, token)).Success)
                 throw new FtpCommandException(reply);
 
             if (reply.Type == FtpResponseType.PositiveIntermediate
-                && !(reply = await ExecuteAsync("PASS " + password)).Success)
+                && !(reply = await ExecuteAsync("PASS " + password, token)).Success)
                 throw new FtpCommandException(reply);
         }
 #endif
@@ -1587,13 +1653,13 @@ namespace FluentFTP {
 							Execute("QUIT");
 						}
 					} catch (SocketException sockex) {
-						FtpTrace.WriteStatus(FtpTraceLevel.Warn, "FtpClient.Disconnect(): SocketException caught and discarded while closing control connection: " + sockex.ToString());
+						this.LogStatus(FtpTraceLevel.Warn, "FtpClient.Disconnect(): SocketException caught and discarded while closing control connection: " + sockex.ToString());
 					} catch (IOException ioex) {
-						FtpTrace.WriteStatus(FtpTraceLevel.Warn, "FtpClient.Disconnect(): IOException caught and discarded while closing control connection: " + ioex.ToString());
+						this.LogStatus(FtpTraceLevel.Warn, "FtpClient.Disconnect(): IOException caught and discarded while closing control connection: " + ioex.ToString());
 					} catch (FtpCommandException cmdex) {
-						FtpTrace.WriteStatus(FtpTraceLevel.Warn, "FtpClient.Disconnect(): FtpCommandException caught and discarded while closing control connection: " + cmdex.ToString());
+						this.LogStatus(FtpTraceLevel.Warn, "FtpClient.Disconnect(): FtpCommandException caught and discarded while closing control connection: " + cmdex.ToString());
 					} catch (FtpException ftpex) {
-						FtpTrace.WriteStatus(FtpTraceLevel.Warn, "FtpClient.Disconnect(): FtpException caught and discarded while closing control connection: " + ftpex.ToString());
+						this.LogStatus(FtpTraceLevel.Warn, "FtpClient.Disconnect(): FtpException caught and discarded while closing control connection: " + ftpex.ToString());
 					} finally {
 						m_stream.Close();
 					}
@@ -1617,8 +1683,8 @@ namespace FluentFTP {
 			IAsyncResult ar;
 			AsyncDisconnect func;
 
-			ar = (func = new AsyncDisconnect(Disconnect)).BeginInvoke(callback, state);
 			lock (m_asyncmethods) {
+				ar = (func = new AsyncDisconnect(Disconnect)).BeginInvoke(callback, state);
 				m_asyncmethods.Add(ar, func);
 			}
 
@@ -1639,32 +1705,31 @@ namespace FluentFTP {
 		/// <summary>
 		/// Disconnects from the server asynchronously
 		/// </summary>
-		public async Task DisconnectAsync() {
-			//TODO:  Add cancellation support
+		public async Task DisconnectAsync(CancellationToken token = default(CancellationToken)) {
 			if (m_stream != null && m_stream.IsConnected)
 			{
 				try
 				{
 					if (!UngracefullDisconnection)
 					{
-						await ExecuteAsync("QUIT");
+						await ExecuteAsync("QUIT", token);
 					}
 				}
 				catch (SocketException sockex)
 				{
-					FtpTrace.WriteStatus(FtpTraceLevel.Warn, "FtpClient.Disconnect(): SocketException caught and discarded while closing control connection: " + sockex.ToString());
+					this.LogStatus(FtpTraceLevel.Warn, "FtpClient.Disconnect(): SocketException caught and discarded while closing control connection: " + sockex.ToString());
 				}
 				catch (IOException ioex)
 				{
-					FtpTrace.WriteStatus(FtpTraceLevel.Warn, "FtpClient.Disconnect(): IOException caught and discarded while closing control connection: " + ioex.ToString());
+					this.LogStatus(FtpTraceLevel.Warn, "FtpClient.Disconnect(): IOException caught and discarded while closing control connection: " + ioex.ToString());
 				}
 				catch (FtpCommandException cmdex)
 				{
-					FtpTrace.WriteStatus(FtpTraceLevel.Warn, "FtpClient.Disconnect(): FtpCommandException caught and discarded while closing control connection: " + cmdex.ToString());
+					this.LogStatus(FtpTraceLevel.Warn, "FtpClient.Disconnect(): FtpCommandException caught and discarded while closing control connection: " + cmdex.ToString());
 				}
 				catch (FtpException ftpex)
 				{
-					FtpTrace.WriteStatus(FtpTraceLevel.Warn, "FtpClient.Disconnect(): FtpException caught and discarded while closing control connection: " + ftpex.ToString());
+					this.LogStatus(FtpTraceLevel.Warn, "FtpClient.Disconnect(): FtpException caught and discarded while closing control connection: " + ftpex.ToString());
 				}
 				finally
 				{
@@ -1764,7 +1829,15 @@ namespace FluentFTP {
 				else
 					path = "./";
 
-			} else if (!path.StartsWith("/")) {
+				// FIX : #153 ensure this check works with unix & windows
+			} else if (!path.StartsWith("/") && path.Substring(1, 1) != ":") {
+
+				// FIX : #380 for OpenVMS absolute paths are "SYS$SYSDEVICE:[USERS.mylogin]"
+				if (ServerType == FtpServer.OpenVMS) {
+					if (path.Contains("$") && path.Contains(":[") && path.Contains("]")) {
+						return path;
+					}
+				}
 
 				// if relative path given then add working dir to calc full path
 				string pwd = GetWorkingDirectory();
@@ -1781,13 +1854,13 @@ namespace FluentFTP {
         /// <summary>
         /// Ensure a relative path is absolute by appending the working dir
         /// </summary>
-        private async Task<string> GetAbsolutePathAsync(string path)
+        private async Task<string> GetAbsolutePathAsync(string path, CancellationToken token)
         {
             if (path == null || path.Trim().Length == 0)
             {
 
                 // if path not given, then use working dir
-                string pwd = await GetWorkingDirectoryAsync();
+                string pwd = await GetWorkingDirectoryAsync(token);
                 if (pwd != null && pwd.Trim().Length > 0)
                     path = pwd;
                 else
@@ -1798,7 +1871,7 @@ namespace FluentFTP {
             {
 
                 // if relative path given then add working dir to calc full path
-                string pwd = await GetWorkingDirectoryAsync();
+                string pwd = await GetWorkingDirectoryAsync(token);
                 if (pwd != null && pwd.Trim().Length > 0)
                 {
                     if (path.StartsWith("./"))
@@ -1865,13 +1938,13 @@ namespace FluentFTP {
 		private void ReadStaleData(bool closeStream, bool evenEncrypted, bool traceData) {
 			if (m_stream != null && m_stream.SocketDataAvailable > 0) {
 				if (traceData) {
-					FtpTrace.WriteStatus(FtpTraceLevel.Info, "There is stale data on the socket, maybe our connection timed out or you did not call GetReply(). Re-connecting...");
+					this.LogStatus(FtpTraceLevel.Info, "There is stale data on the socket, maybe our connection timed out or you did not call GetReply(). Re-connecting...");
 				}
 				if (m_stream.IsConnected && (!m_stream.IsEncrypted || evenEncrypted)) {
 					byte[] buf = new byte[m_stream.SocketDataAvailable];
 					m_stream.RawSocketRead(buf);
 					if (traceData) {
-						FtpTrace.WriteStatus(FtpTraceLevel.Verbose, "The stale data was: " + Encoding.GetString(buf).TrimEnd('\r', '\n'));
+						this.LogStatus(FtpTraceLevel.Verbose, "The stale data was: " + Encoding.GetString(buf).TrimEnd('\r', '\n'));
 					}
 				}
 
@@ -1882,29 +1955,31 @@ namespace FluentFTP {
 		}
 
 #if ASYNC
-        /// <summary>
-        /// Data shouldn't be on the socket, if it is it probably
-        /// means we've been disconnected. Read and discard
-        /// whatever is there and close the connection (optional).
-        /// </summary>
-        /// <param name="closeStream">close the connection?</param>
-        /// <param name="evenEncrypted">even read encrypted data?</param>
-        /// <param name="traceData">trace data to logs?</param>
-        private async Task ReadStaleDataAsync(bool closeStream, bool evenEncrypted, bool traceData)
+		/// <summary>
+		/// Data shouldn't be on the socket, if it is it probably
+		/// means we've been disconnected. Read and discard
+		/// whatever is there and close the connection (optional).
+		/// </summary>
+		/// <param name="closeStream">close the connection?</param>
+		/// <param name="evenEncrypted">even read encrypted data?</param>
+		/// <param name="traceData">trace data to logs?</param>
+		/// <param name="token">Cancellation Token</param>
+
+		private async Task ReadStaleDataAsync(bool closeStream, bool evenEncrypted, bool traceData, CancellationToken token)
         {
             if (m_stream != null && m_stream.SocketDataAvailable > 0)
             {
                 if (traceData)
                 {
-                    FtpTrace.WriteStatus(FtpTraceLevel.Info, "There is stale data on the socket, maybe our connection timed out or you did not call GetReply(). Re-connecting...");
+                    this.LogStatus(FtpTraceLevel.Info, "There is stale data on the socket, maybe our connection timed out or you did not call GetReply(). Re-connecting...");
                 }
                 if (m_stream.IsConnected && (!m_stream.IsEncrypted || evenEncrypted))
                 {
                     byte[] buf = new byte[m_stream.SocketDataAvailable];
-                    await m_stream.RawSocketReadAsync(buf);
+                    await m_stream.RawSocketReadAsync(buf, token);
                     if (traceData)
                     {
-                        FtpTrace.WriteStatus(FtpTraceLevel.Verbose, "The stale data was: " + Encoding.GetString(buf).TrimEnd('\r', '\n'));
+                        this.LogStatus(FtpTraceLevel.Verbose, "The stale data was: " + Encoding.GetString(buf).TrimEnd('\r', '\n'));
                     }
                 }
 
@@ -1920,7 +1995,7 @@ namespace FluentFTP {
 			return (this is FtpClientProxy);
 		}
 
-		private static string[] fileNotFoundStrings = new string[] { "can't check for file existence", "does not exist", "failed to open file", "not found", "no such file", "cannot find the file", "cannot find", "could not get file", "not a regular file", "file unavailable", "file is unavailable", "file not unavailable", "file is not available", "no files found", "no file found" };
+		private static string[] fileNotFoundStrings = new string[] { "can't find file, can't check for file existence", "does not exist", "failed to open file", "not found", "no such file", "cannot find the file", "cannot find", "could not get file", "not a regular file", "file unavailable", "file is unavailable", "file not unavailable", "file is not available", "no files found", "no file found" };
 		private bool IsKnownError(string reply, string[] strings) {
 			reply = reply.ToLower();
 			foreach (string msg in strings) {
@@ -1931,6 +2006,77 @@ namespace FluentFTP {
 			return false;
 		}
 
+		#endregion
+
+		#region Logging
+
+		/// <summary>
+		/// Add a custom listener here to get events every time a message is logged.
+		/// </summary>
+		public Action<FtpTraceLevel, string> OnLogEvent;
+
+		/// <summary>
+		/// Log a function call with relavent arguments
+		/// </summary>
+		/// <param name="function">The name of the API function</param>
+		/// <param name="args">The args passed to the function</param>
+		public void LogFunc(string function, object[] args = null) {
+
+			// log to attached logger if given
+			if (OnLogEvent != null) {
+				OnLogEvent(FtpTraceLevel.Verbose, ">         " + function + "(" + args.ItemsToString().Join(", ") + ")");
+			}
+
+			// log to system
+			FtpTrace.WriteFunc(function, args);
+		}
+		/// <summary>
+		/// Log a message
+		/// </summary>
+		/// <param name="eventType">The type of tracing event</param>
+		/// <param name="message">The message to write</param>
+		public void LogLine(FtpTraceLevel eventType, string message) {
+
+			// log to attached logger if given
+			if (OnLogEvent != null) {
+				OnLogEvent(eventType, message);
+			}
+
+			// log to system
+			FtpTrace.WriteLine(eventType, message);
+		}
+
+		/// <summary>
+		/// Log a message, adding an automatic prefix to the message based on the `eventType`
+		/// </summary>
+		/// <param name="eventType">The type of tracing event</param>
+		/// <param name="message">The message to write</param>
+		public void LogStatus(FtpTraceLevel eventType, string message) {
+
+			// add prefix
+			message = TraceLevelPrefix(eventType) + message;
+
+			// log to attached logger if given
+			if (OnLogEvent != null) {
+				OnLogEvent(eventType, message);
+			}
+
+			// log to system
+			FtpTrace.WriteLine(eventType, message);
+		}
+		private static string TraceLevelPrefix(FtpTraceLevel level) {
+			switch (level) {
+				case FtpTraceLevel.Verbose:
+					return "Status:   ";
+				case FtpTraceLevel.Info:
+					return "Status:   ";
+				case FtpTraceLevel.Warn:
+					return "Warning:  ";
+				case FtpTraceLevel.Error:
+					return "Error:    ";
+			}
+			return "Status:   ";
+		}
 		#endregion
 
 		#region Static API

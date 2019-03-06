@@ -24,6 +24,7 @@ It is written entirely in C#, with no external dependencies. FluentFTP is releas
   - Get the [hash/checksum](#file-hashing) of a file (SHA-1, SHA-256, SHA-512, and MD5)
   - Dereference of symbolic links to calculate the linked file/folder
 - **FTP protocol:**
+  - Automatic detection of the [FTP server software](#faq_servertype) and its [capabilities](#faq_recursivelist)
   - Extensive support for [FTP commands](#ftp-support), including some server-specific commands
   - Easily send [server-specific](https://github.com/hgupta9/FluentFTP/issues/88) FTP commands using the `Execute()` method
   - Explicit and Implicit [SSL connections](#faq_ftps) are supported for the control and data connections using .NET's `SslStream`
@@ -33,8 +34,10 @@ It is written entirely in C#, with no external dependencies. FluentFTP is releas
   - [FTP command logging](#faq_log) using `TraceListeners` (passwords omitted) to [trace](#faq_trace) or [log output](#faq_logfile) to a file
   - SFTP is not supported as it is FTP over SSH, a completely different protocol (use [SSH.NET](https://github.com/sshnet/SSH.NET) for that)
 - **Asynchronous support:**
-  - Synchronous and asynchronous methods using `async`/`await` for all operations 
+  - Synchronous and asynchronous methods using `async`/`await` for all operations
   - Asynchronous methods for .NET 4.0 and below using `IAsyncResult` pattern (Begin*/End*)
+  - All asynchronous methods can be cancelled midway by passing a `CancellationToken`
+  - All asynchronous methods honor the `ReadTimeout` and automatically cancel themselves if timed out
   - Improves thread safety by cloning the FTP control connection for file transfers (optional)
   - Implements its own internal locking in an effort to keep transactions synchronized
 - **Extensible:**
@@ -101,16 +104,16 @@ foreach (FtpListItem item in client.GetListing("/htdocs")) {
 }
 
 // upload a file
-client.UploadFile(@"C:\MyVideo.mp4", "/htdocs/big.txt");
+client.UploadFile(@"C:\MyVideo.mp4", "/htdocs/MyVideo.mp4");
 
 // rename the uploaded file
-client.Rename("/htdocs/big.txt", "/htdocs/big2.txt");
+client.Rename("/htdocs/MyVideo.mp4", "/htdocs/MyVideo_2.mp4");
 
 // download the file again
-client.DownloadFile(@"C:\MyVideo_2.mp4", "/htdocs/big2.txt");
+client.DownloadFile(@"C:\MyVideo_2.mp4", "/htdocs/MyVideo_2.mp4");
 
 // delete the file
-client.DeleteFile("/htdocs/big2.txt");
+client.DeleteFile("/htdocs/MyVideo_2.mp4");
 
 // delete a folder recursively
 client.DeleteDirectory("/htdocs/extras/");
@@ -144,9 +147,8 @@ client.Disconnect();
     - [Logging](#logging)
 - [FTP Support Table](#ftp-support)
 - [Examples](https://github.com/hgupta9/FluentFTP/tree/master/FluentFTP.Examples)
-- [Release Notes](#release-notes)
-- [Misc Notes](#notes)
-- [Credits](#credits)
+- [Release Notes](https://github.com/robinrodricks/FluentFTP/blob/master/RELEASES.md)
+- [Notes](https://github.com/robinrodricks/FluentFTP/blob/master/NOTES.md)
 
 ## FAQs
 
@@ -165,6 +167,7 @@ client.Disconnect();
 - [How do I connect with SFTP?](#faq_sftp)
 - [How do I login with an anonymous FTP account?](#faq_loginanon)
 - [How do I login with an FTP proxy?](#faq_loginproxy)
+- [How do I detect the type of server I'm connecting to?](#faq_servertype)
 - [How do I use client certificates to login with FTPS?](#faq_certs)
 - [How do I bundle an X509 certificate from a file?](#faq_x509)
 
@@ -172,15 +175,17 @@ client.Disconnect();
 - [How can I track the progress of file transfers?](#faq_progress)
 - [How can I upload data created on the fly?](#faq_uploadbytes)
 - [How can I download data without saving it to disk?](#faq_downloadbytes)
+- [How can I resume downloading a file?](#faq_resumedownload)
+- [How can I resume uploading a file?](#faq_uploadmissing)
 - [How can I throttle the speed of upload/download?](#faq_throttle)
 - [How do I verify the hash/checksum of a file and retry if the checksum mismatches?](#faq_verifyhash)
-- [How do I upload only the missing part of a file?](#faq_uploadmissing)
 - [How do I append to a file?](#faq_append)
 - [How do I download files using the low-level API?](#faq_downloadlow)
 - [How can I upload/download files with Unicode filenames when my server does not support UTF8?](#faq_utf)
 
 **File Management FAQs**
 - [How does GetListing() work internally?](#faq_listings)
+- [How does GetListing() return a recursive file listing?](#faq_recursivelist)
 - [What kind of hashing commands are supported?](#faq_hashing)
 
 **Misc FAQs**
@@ -224,16 +229,21 @@ Complete API documentation for the `FtpClient` class, which handles all FTP/FTPS
 
 - **SystemType** - Gets the type of system/server that we're connected to.
 
+- **ServerType** - Gets the type of the FTP server software that we're connected to, using the `FtpServer` enum. If it does not detect your specific server software, please contribute a [detection script](#faq_recursivelist). **Default:** `FtpServer.Unknown`
+
+- **ServerOS** - Gets the operating system of the FTP server software that we're connected to, using the `FtpOS` enum. **Default:** `FtpOS.Unknown`
+
 - **IsConnected** - Checks if the connection is still alive.
 
 - **Capabilities** - Gets the server capabilties (represented by flags).
 
 - **HasFeature**() - Checks if a specific feature (`FtpCapability`) is supported by the server.
 
+- **LastReply** - Returns the last `FtpReply` recieved from the server.
 
 ### Directory Listing
 
-- **GetListing**() - Get a [file listing](#faq_listings) of the given directory. Returns one `FtpListItem` per file or folder with all available properties set. Each item contains:
+- **GetListing**() - Get a [file listing](#faq_listings) of the given directory. Add `FtpListOption.Recursive` to recursively list all the sub-directories as well. Returns one `FtpListItem` per file or folder with all available properties set. Each item contains:
 
 	- `Type` : The type of the object. (File, Directory or Link)
 	
@@ -261,7 +271,7 @@ Complete API documentation for the `FtpClient` class, which handles all FTP/FTPS
 
 	- `OtherPermissions` : Other rights. Any combination of 'r', 'w', 'x' (using the `FtpPermission` enum). **Default:** `FtpPermission.None` if not provided by server.
 
-	- `RawPermissions` : The raw permissions string recieved for this object. Use this if other permission properties are blank or invalid.
+	- `RawPermissions` : The raw permissions string received for this object. Use this if other permission properties are blank or invalid.
 
 	- `Input` : The raw string that the server returned for this object. Helps debug if the above properties have been correctly parsed.
 	
@@ -279,9 +289,9 @@ Complete API documentation for the `FtpClient` class, which handles all FTP/FTPS
 
 - **Download**() - Downloads a file from the server to a Stream or byte[]. Returns true if succeeded, false if failed or file does not exist. Exceptions are thrown for critical errors. Supports very large files since it downloads data in chunks.
 
-- **UploadFile**() - Uploads a file from the local file system to the server. Use `FtpExists.Append` to append to a file. Returns true if succeeded, false if failed or file does not exist. Exceptions are thrown for critical errors. Supports very large files since it uploads data in chunks. Optionally [verifies the hash](#faq_verifyhash) of a file & retries transfer if hash mismatches.
+- **UploadFile**() - Uploads a file from the local file system to the server. Use `FtpExists.Append` to resume a partial upload. Returns true if succeeded, false if failed or file does not exist. Exceptions are thrown for critical errors. Supports very large files since it uploads data in chunks. Optionally [verifies the hash](#faq_verifyhash) of a file & retries transfer if hash mismatches.
 
-- **DownloadFile**() - Downloads a file from the server to the local file system. Returns true if succeeded, false if failed or file does not exist. Exceptions are thrown for critical errors. Supports very large files since it downloads data in chunks. Local directories are created if they do not exist. Optionally [verifies the hash](#faq_verifyhash) of a file & retries transfer if hash mismatches.
+- **DownloadFile**() - Downloads a file from the server to the local file system. Use `FtpLocalExists.Append` to resume a partial download. Returns true if succeeded, false if failed or file does not exist. Exceptions are thrown for critical errors. Supports very large files since it downloads data in chunks. Local directories are created if they do not exist. Optionally [verifies the hash](#faq_verifyhash) of a file & retries transfer if hash mismatches.
 
 - **UploadFiles**() - Uploads multiple files from the local file system to a single folder on the server. Returns the number of files uploaded. Skipped files are not counted. User-defined error handling for exceptions during file upload (ignore/abort/throw).  Optionally [verifies the hash](#faq_verifyhash) of a file & retries transfer if hash mismatches. Faster than calling `UploadFile()` multiple times.
 
@@ -423,7 +433,7 @@ Complete API documentation for the `FtpClient` class, which handles all FTP/FTPS
 
 - **TimeOffset** - Time difference between server and client, in hours. If the server is located in Amsterdam and you are in Los Angeles then the time difference is 9 hours. **Default:** 0.
 
-- **RecursiveList** - Check if your server supports a recursive LIST command (`LIST -R`). If you know for sure that this is unsupported, set it to false. **Default:** true.
+- **RecursiveList** - Check if your server supports a recursive LIST command (`LIST -R`).
 
 - **BulkListing** - If true, increases performance of GetListing by reading multiple lines of the file listing at once. If false then GetListing will read file listings line-by-line. If GetListing is having issues with your server, set it to false. **Default:** true.
 
@@ -456,7 +466,7 @@ Complete API documentation for the `FtpClient` class, which handles all FTP/FTPS
 
 - **ConnectTimeout** - Time to wait (in milliseconds) for a connection attempt to succeed, before giving up. **Default:** 15000 (15 seconds).
 
-- **ReadTimeout** - Time to wait (in milliseconds) for data to be read from the underlying stream, before giving up. **Default:** 15000 (15 seconds).
+- **ReadTimeout** - Time to wait (in milliseconds) for data to be read from the underlying stream, before giving up. Honored by all asynchronous methods as well. **Default:** 15000 (15 seconds).
 
 - **DataConnectionConnectTimeout** - Time to wait (in milliseconds) for a data connection to be established, before giving up. **Default:** 15000 (15 seconds).
 
@@ -499,7 +509,9 @@ Please access these static methods directly under the `FtpClient` class.
 
 Please see these [FAQ entries](#faq_trace) for help on logging & debugging.
 
-- FtpTrace.**LogFunctions** - Log all high-level function calls. **Default:** true.
+- client.**OnLogEvent** - A property of `FtpClient`. Assign this to a callback that will be fired every time a message is logged.
+
+- FtpTrace.**LogFunctions** - Include high-level function calls in logs? **Default:** true.
 
 - FtpTrace.**LogIP** - Include server IP addresses in logs? **Default:** true.
 
@@ -601,13 +613,13 @@ void OnValidateCertificate(FtpClient control, FtpSslValidationEventArgs e) {
 <a name="faq_ftps"></a>
 **How do I validate the server's certificate when using FTPS?**
 
-First you must discover the string of the valid certificate. Use this code to save the the valid certificate string to a file:
+First you must discover the string of the valid certificate. Use this code to save the valid certificate string to a file:
 ```cs
 void OnValidateCertificate(FtpClient control, FtpSslValidationEventArgs e) {
     File.WriteAllText(@"C:\cert.txt", e.Certificate.GetRawCertDataString());
 }
 ```
-Then finally use this code to check if the recieved certificate matches the one you trust:
+Then finally use this code to check if the received certificate matches the one you trust:
 ```cs
 string ValidCert = "<insert contents of cert.txt>";
 void OnValidateCertificate(FtpClient control, FtpSslValidationEventArgs e)  {
@@ -678,12 +690,12 @@ Now call the Upload/Download method providing the new `progress` object that you
 
 *Using the asynchronous API:*
 ```cs
-await client.DownloadFileAsync(localPath, remotePath, true, FluentFTP.FtpVerify.Retry, progress);
+await client.DownloadFileAsync(localPath, remotePath, FtpLocalExists.Overwrite, FluentFTP.FtpVerify.Retry, progress);
 ```
 
 *Using the synchronous API:*
 ```cs
-client.DownloadFile(localPath, remotePath, true, FluentFTP.FtpVerify.Retry, progress);
+client.DownloadFile(localPath, remotePath, FtpLocalExists.Overwrite, FluentFTP.FtpVerify.Retry, progress);
 ```
 
 For .NET 2.0 users, pass an implementation of the `IProgress` class. The `Report()` method of the object you pass will be called with the progress value.
@@ -701,6 +713,39 @@ Use Upload() for uploading a `Stream` or `byte[]`.
 **How can I download data without saving it to disk?**
 
 Use Download() for downloading to a `Stream` or `byte[]`.
+
+
+--------------------------------------------------------
+<a name="faq_resumedownload"></a>
+**How can I resume downloading a file?**
+
+Use DownloadFile() or DownloadFiles() with the `existsMode` set to `FtpLocalExists.Append`.
+
+```cs
+// download only the missing part of the file
+// by comparing its file size to the size of the local file
+client.DownloadFile(@"C:\MyVideo.mp4", "/htdocs/MyVideo.mp4", FtpLocalExists.Append);
+```
+
+Other options are:
+
+- `FtpLocalExists.Skip` - If the local file exists, we blindly skip downloading it without any more checks.
+
+- `FtpLocalExists.Overwrite` - If the local file exists, we restart the download and overwrite the file. 
+
+- `FtpLocalExists.Append` - If the local file exists, we resume the download by checking the local file size, and append the missing data to the file.
+
+
+--------------------------------------------------------
+<a name="faq_uploadmissing"></a>
+**How can I resume uploading a file?**
+
+Using the new UploadFile() API:
+```cs
+// we compare the length of the offline file vs the online file,
+// and only write the missing part to the server
+client.UploadFile("C:\bigfile.iso", "/htdocs/bigfile.iso", FtpExists.Append);
+```
 
 
 --------------------------------------------------------
@@ -741,17 +786,6 @@ All the possible configurations are:
 
 - `FtpVerify.Retry | FtpVerify.Delete | FtpVerify.Throw` - Verify checksum, retry copying X times, delete target file if still mismatching, then throw an error
 
-
---------------------------------------------------------
-<a name="faq_uploadmissing"></a>
-**How do I upload only the missing part of a file?**
-
-Using the new UploadFile() API:
-```cs
-// we compare the length of the offline file vs the online file,
-// and only write the missing part to the server
-client.UploadFile("C:\bigfile.iso", "/htdocs/bigfile.iso", FtpExists.Append);
-```
 
 --------------------------------------------------------
 <a name="faq_append"></a>
@@ -862,6 +896,24 @@ Here is the full list of codepages based on the charset you need:
 
 
 --------------------------------------------------------
+<a name="faq_recursivelist"></a>
+**How does GetListing() return a recursive file listing?**
+
+In older versions of FluentFTP, we assumed that all servers supported recursive listings via the `LIST -R` command. However this caused numerous issues with various FTP servers that did not support recursive listings: The `GetListing()` call would simply return the contents of the first directory without any of the child directories included.
+
+Therefore, since version 20.0.0, we try to detect the FTP server software and if we determine that it does not support recursive listing, we do our own manual recursion. We begin by assuming that all servers do not support recursive listing, and then whitelist specific server types.
+
+If you feel that `GetListing()` is too slow when using recursive listings, and you know that your FTP server software supports the `LIST -R` command, then please contribute support for your server:
+
+1. Add your FTP server type in the `FtpServer` enum.
+
+2. Add code in `FtpClient.DetectFtpServer()` to detect your FTP server software.
+
+3. Add code in `FtpClient.RecursiveList()` to return `true` for the detected server.
+
+
+
+--------------------------------------------------------
 <a name="faq_hashing"></a>
 **What kind of hashing commands are supported?**
 
@@ -895,6 +947,9 @@ FtpTrace.LogUserName = false; 	// hide FTP user names
 FtpTrace.LogPassword = false; 	// hide FTP passwords
 FtpTrace.LogIP = false; 	// hide FTP server IP addresses
 ```
+
+Alternatively you can hook onto `client.OnLogEvent` to get a callback every time a message is logged in the context of an individual `FtpClient` instance.
+
 
 
 --------------------------------------------------------
@@ -1044,6 +1099,36 @@ First you must "fork" FluentFTP, then make changes on your local version, then s
 17. Type details about the changes you made in the description
 18. Click **Create pull request**
 19. Thank you!
+
+
+
+--------------------------------------------------------
+<a name="faq_servertype"></a>
+**How do I detect the type of server I'm connecting to?**
+
+You can read `ServerType` to get the exact type of FTP server software that you've connected to. We dynamically detect the FTP server software based on the welcome message it sends when you've just connected to it. We can currently detect:
+
+- PureFTPd
+- VsFTPd
+- ProFTPD
+- WuFTPd
+- FileZilla Server
+- OpenVMS
+- Windows Server/IIS
+- Windows CE
+- GlobalScape EFT
+- HP NonStop/Tandem
+- Serv-U
+- Cerberus
+- CrushFTP
+- glFTPd
+
+You can also read `ServerOS` to get the operating system of the FTP server you've connected to. We can detect:
+
+- Windows
+- Unix
+- VMS
+- IBM OS/400
 
 
 --------------------------------------------------------
@@ -1215,294 +1300,3 @@ Try reducing the polling interval to ensure that the connection does not time-ou
 ```cs
 client.SocketPollInterval = 1000;
 ```
-
-## Notes
-
-### Semantic Versioning
-
-FluentFTP uses [semantic versioning](http://semver.org/), a package numbering scheme that indicates API compatibility between releases. A version consists of `MAJOR.MINOR.PATCH`, that use this scheme:
-
- - **Major** version changed when incompatible/breaking changes are made to the API
-   - eg: Methods/properties are removed, Method arguments are removed/refactored
-	
- - **Minor** version changed when functionality has been added in a backwards-compatible manner
-   - eg: Methods/properties are added, New arguments added into methods
-	
- - **Patch** version changed when backwards-compatible bug fixes are released 
-   - eg: Fixes/minor features are added
-
-### Stream Handling
-
-FluentFTP returns a `Stream` object for file transfers. This stream **must** be properly closed when you are done. Do not leave it for the GC to cleanup otherwise you can end up with uncatchable exceptions, i.e., a program crash. The stream objects are actually wrappers around `NetworkStream` and `SslStream` which perform cleanup routines on the control connection when the stream is closed. These cleanup routines can trigger exceptions so it's vital that you properly dispose the objects when you are done, no matter what. A proper implementation should go along the lines of:
-
-``````
-try {
-   using(Stream s = ftpClient.OpenRead()) {
-       // perform your transfer
-   }
-   ftpClient.GetReply(); // read success/failure messages from server
-}
-catch(Exception) {
-   // Typical exceptions here are IOException, SocketException, or a FtpCommandException
-}
-``````
-
-The using statement above will ensure that `Dispose()` is called on the stream which in turn will call `Close()` so that the necessary cleanup routines on the control connection can be performed. If an exception is triggered you will have a chance to catch and handle it. Another valid approach might look like so:
-
-``````
-Stream s = null;
-
-try {
-	s = ftpClient.OpenRead();
-	// perform transfer
-}
-finally {
-	if(s != null)
-		s.Close();
-	ftpClient.GetReply(); // read success/failure messages from server
-}
-``````
-
-The finally block above ensures that `Close()` is always called on the stream even if a problem occurs. When `Close()` is called any resulting exceptions can be caught and handled accordingly.
-
-### Exception Handling
-
-FluentFTP includes exception handling in key places where uncatchable exceptions could occur, such as the `Dispose()` methods. The problem is that part of the cleanup process involves closing out the internal sockets and streams. If `Dispose()` was called because of an exception and triggers another exception while trying to clean-up you could end up with an un-catchable exception resulting in an application crash. To deal with this `FtpClient.Dispose()` and `FtpSocketStream.Dispose()` are setup to handle `SocketException` and `IOException` and discard them. The exceptions are written to the FtpTrace `TraceListeners` for debugging purposes, in an effort to not hide important errors while debugging problems with the code.
-
-The exception that propagates back to your code should be the root of the problem and any exception caught while disposing would be a side affect however while testing your project pay close attention to what's being logged via FtpTrace. See the Debugging example for more information about using `TraceListener` objects with FluentFTP.
-
-### Handling Ungraceful Interruptions in the Control Connection
-
-FluentFTP uses `Socket.Poll()` to test for connectivity after a user-definable period of time has passed since the last activity on the control connection. When the remote host closes the connection there is no way to know, without triggering an exception, other than using `Poll()` to make an educated guess. When the connectivity test fails the connection is automatically re-established. This process helps a great deal in gracefully reconnecting however it does not eliminate your responsibility for catching IOExceptions related to an ungraceful interruption in the connection. Usually, maybe always, when this occurs the InnerException will be a SocketException. How you want to handle the situation from there is up to you.
-
-```````
-try {
-    // ftpClient.SomeMethod();
-}
-catch(IOException e) {
-    if(e.InnertException is SocketException) {
-         // the control connection was interrupted
-    }
-}
-```````
-
-### Pipelining
-
-If you just wanting to enable pipelining (in `FtpClient` and `FtpControlConnection`), set the `EnablePipelining` property to true. Hopefully this is all you need but it may not be. Some servers will drop the control connection if you flood it with a lot of commands. This is where the `MaxPipelineExecute` property comes into play. The default value here is 20, meaning that if you have 100 commands queued, 20 of the commands will be written to the underlying socket and 20 responses will be read, then the next 20 will be executed, and so forth until the command queue is empty. The value 20 is not a magic number, it's just the number that I deemed stable in most scenarios. If you increase the value, do so knowing that it could break your control connection.
-
-### Pipelining your own Commands
-
-Pipelining your own commands is not dependent on the `EnablePipelining` feature. The `EnablePipelining` property only applies to internal pipelining performed by FtpClient and FtpControlConnection. You can use the facilities for creating pipelines at your own discretion. 
-
-If you need to cancel your pipeline in the middle of building your queue, you use the `CancelPipeline()` method. These methods are implemented in the `FtpControlConnection` class so people that are extending this class also have access to them. This feature is also used in `FtpClient.GetListing()` to retrieve last write times of the files in the listing when the LIST command is used. 
-
-You don't need to worry about locking the command channel (`LockControlConnection()` or `UnlockControlConnection()`) because the code that handles executing the pipeline does so for you.
-
-Here's a quick example:
-
-`````
-FtpClient cl = new FtpClient();
-
-...
-
-// initalize the pipeline
-cl.BeginExecute();
-
-// execute commands as normal
-cl.Execute("foo");
-cl.Execute("bar");
-cl.Execute("baz");
-
-...
-
-// execute the queued commands
-FtpCommandResult[] res = cl.EndExecute();
-
-// check the result status of the commands
-foreach(FtpCommandResult r in res) {
-	if(!r.ResponseStatus) {
-          // we have a failure
-	}
-}
-``````
-
-### Bulk Downloads
-
-When doing a large number of transfers, one needs to be aware of some inherit issues with data streams. When a socket is opened and then closed, the socket is left in a linger state for a period of time defined by the operating system. The socket cannot reliably be re-used until the operating system takes it out of the TIME WAIT state. This matters because a data stream is opened when it's needed and closed as soon as that specific task is done:
-- Download File
-  - Open Data Stream
-    - Read bytes
-  - Close Data Stream
-
-This is not a bug in FluentFTP. RFC959 says that EOF on stream mode transfers is signaled by closing the connection. On downloads and file listings, the sockets being used on the server will stay in the TIME WAIT state because the server closes the socket when it's done sending the data. On uploads, the client sockets will go into the TIME WAIT state because the client closes the connection to signal EOF to the server.
-
-## Release Notes
-
-#### 19.1.2
-- Fix: Add support for checking if file exists on Serv-U FTP Server
-- Fix: Make IFtpClient inherit from IDisposable (thanks @repl-andrew-ovens)
-- (UWP) Fix: UWP does not allow File.Exists() to run in UI thread (thanks @taoyouh)
-
-#### 19.1.1
-- Fix: When downloading files in ASCII mode, file length is unreliable therefore we read until EOF
-- Fix: When upload/download progress is indeterminate, send -1 instead of NaN or Infinity
-- Fix: NetStream was not assigned in FtpSocketStream for .NET Standard in active FTP mode (thanks @ralftar)
-- Fix: CurrentDataType was not set for ASCII transfers in DownloadFileAsync/UploadFileAsync (thanks @taoyouh)
-- Fix: Sometimes FtpSocketStream and FtpDataStream are not disposed in FtpSocketStream.Dispose (thanks @taoyouh)
-
-#### 19.1.0
-- New Progress reporting for UploadFile & DownloadFile methods via IProgress
-- Fix: Stream.Position should not be set in UploadFileInternal unless supported
-
-#### 19.0.0
-- New Task-based async methods for .NET Standard and .NET Fx 4.5 (thanks @taoyouh)
-- New async methods for UploadFile, DownloadFile, UploadFiles & DownloadFiles (thanks @artiomchi)
-- (UWP) Fix: FileNotFoundException with reference System.Console (thanks @artiomchi)
-- (.NET core) Fix: Thread suspends when calling UploadFile or DownloadFile (thanks @artiomchi)
-- (.NET core) Fix: File download hangs inconsistently when reading data from stream (thanks @artiomchi, @bgroenks96)
-- (.NET core) Fix: Stream does not dispose due to wrong handling of closing/disposing (thanks @artiomchi)
-- Fix: File upload EOS bug when calling Stream.Read (thanks @bgroenks96, @artiomchi, @taoyouh)
-- Fix: DownloadFileInternal not recognizing the download data type
-with EnableThreadSafeConnections (thanks @bgroenks96)
-- (Backend) Migrate to a single VS 2017 solution for all frameworks (thanks @artiomchi)
-- (Backend) Continuous Integration using AppVeyor  (thanks @artiomchi)
-
-#### 18.0.1
-- Add IFtpClient interface to build unit tests upon main FtpClient class (thanks [Kris0](https://github.com/Kris0))
-- Disposing FtpDataStream reads server reply and closes the underlying stream (thanks [Lukazoid](https://github.com/Lukazoid))
-
-#### 18.0.0
-- New SetModifiedTime API to change modified date of a server file in local timezone/UTC
-- Add type argument to GetModifiedTime, allowing for getting dates in UTC/Local timezone
-- Breaking changes to Async API of GetModifiedTime (addition of type argument)
-- GetModifiedTime and SetModifiedTime now honor the TimeOffset property in FtpClient
-- Add checkIfFileExists to OpenRead, OpenAppend and OpenWrite to skip GetFileSize check
-- Fix issue where InnerException is null during a file transfer (upload/download)
-- Improve performance of typical uploads/downloads by skipping the extra file exists check
-
-#### 17.6.1
-- Fix for CreateDirectory and DirectoryExists to allow null/blank input path values
-- Fix for GetFtpDirectoryName to return correct parent folder of simple folder paths (thanks [ww898](https://github.com/ww898))
-
-#### 17.6.0
-- Add argument validation for missing/blank arguments in : Upload, Download, UploadFile(s), DownloadFile(s), GetObjectInfo, DeleteFile, DeleteDirectory, FileExists, DirectoryExists, CreateDirectory, Rename, MoveFile, MoveDirectory, SetFilePermissions, Chmod, GetFilePermissions, GetChmod, GetFileSize, GetModifiedTime, VerifyTransfer, OpenRead, OpenWrite, OpenAppend
-- Disable all async methods on .NET core due to persistant PlatformUnsupported exception (if you need async you are free to contribute a non-blocking version of the methods)
-
-#### 17.5.9
-- Increase performance of GetListing by reading multiple lines at once (BulkListing property, thanks [sierrodc](https://github.com/sierrodc))
-
-#### 17.5.8
-- Add support for parsing AS400 listings inside a file (5 fields) (thanks [rharrisxtheta](https://github.com/rharrisxtheta))
-- Retry interpreting file listings after encountered invalid date format (thanks [rharrisxtheta](https://github.com/rharrisxtheta))
-- Always switch into binary mode when running SIZE command (thanks [rharrisxtheta](https://github.com/rharrisxtheta))
-
-#### 17.5.7
-- Honor UploadDataType and DownloadDataType in all sync/async cases (thanks [rharrisxtheta](https://github.com/rharrisxtheta))
-- Force file transfers in BINARY mode for known 0 byte files (thanks [rharrisxtheta](https://github.com/rharrisxtheta))
-- Allow file transfers in ASCII mode if the server doesn't support the SIZE command (thanks [rharrisxtheta](https://github.com/rharrisxtheta))
-
-#### 17.5.6
-- Fix NullReferenceException when arguments are null during FtpTrace.WriteFunc
-
-#### 17.5.5
-- Remove internal locking for .NET Standard 1.4 version since unsupported on UWP
-
-#### 17.5.4
-- Remove dependency on System.Threading.Thread for .NET Standard 1.4 version (for UWP)
-
-#### 17.5.3
-- Allow transferring files in ASCII/Binary mode with the high-level API (UploadDataType, DownloadDataType)
-
-#### 17.5.2
-- Add support for .NET 3.5 and .NET Standard 1.4 (supports Universal Windows Platform 10.0)
-
-#### 17.5.1
-- Add FtpTrace.LogToConsole and LogToFile to control logging in .NET core version
-
-#### 17.5.0
-- Add PlainTextEncryption API to support FTPS servers and plain-text FTP firewalls (CCC command)
-- FluentFTP now uses unsafe code to support the CCC command (inside FtpSslStream)
-- If you need a "non unsafe" version of the library please add an issue
-
-#### 17.4.4
-- Add logging for high-level function calls to improve remote debugging (FtpTrace.LogFunctions)
-- Add settings to hide sensitive data from logs (FtpTrace.LogIP, LogUserName, LogPassword)
-- Add RecursiveList to control if recursive listing should be used
-- Auto-detect Windows CE and disable recursive listing during DeleteDirectory()
-
-#### 17.4.2
-- Add UploadRateLimit and DownloadRateLimit to control the speed of data transfer (thanks [Danie-Brink](https://github.com/Danie-Brink))
-
-#### 17.4.1
-- Fix parsing of LinkTarget during GetListing() on Unix FTP servers
-- Improve logging clarity by removing "FluentFTP" prefix in TraceSource
-
-#### 17.4.0
-- Add MoveFile() and MoveDirectory() to move files and directories safely
-
-#### 17.3.0
-- Automatically verify checksum of a file after upload/download (thanks [jblacker](https://github.com/jblacker))
-- Configurable error handling (abort/throw/ignore) for file transfers (thanks [jblacker](https://github.com/jblacker))
-- Multiple log levels for tracing/logging debug output in FtpTrace (thanks [jblacker](https://github.com/jblacker))
-
-#### 17.2.0
-- Simplify DeleteDirectory() API - the `force` and `fastMode` args are no longer required
-- DeleteDirectory() is faster since it uses one recursive file listing instead of many
-- Remove .NET Standard 1.4 to improve nuget update reliability, since we need 1.6 anyway
-
-#### 17.1.0
-- Split stream API into Upload()/UploadFile() and Download()/DownloadFile()
-
-#### 17.0.0
-- Greatly improve performance of FileExists() and GetNameListing()
-- Add new OS-specific directory listing parsers to GetListing() and GetObjectInfo()
-- Support GetObjectInfo() even if machine listings are not supported by the server
-- Add `existsMode` to UploadFile() and UploadFiles() allowing for skip/overwrite and append
-- Remove all usages of string.Format to fix reliability issues caused with UTF filenames
-- Fix issue of broken files when uploading/downloading through a proxy (thanks [Zoltan666](https://github.com/Zoltan666))
-- GetReply() is now public so users of OpenRead/OpenAppend/OpenWrite can call it after
-
-#### 16.5.0
-- Add async/await support to all methods for .NET 4.5 and onwards (thanks [jblacker](https://github.com/jblacker))
-
-#### 16.4.0
-- Support for .NET Standard 1.4 added.
-
-#### 16.2.5
-- Add UploadFiles() and DownloadFiles() which is faster than single file transfers
-- Allow disabling UTF mode using DisableUTF8 API
-
-#### 16.2.4
-- First .NET Core release (DNXCore5.0) using Visual Studio 2017 project and shared codebase.
-- Support for .NET 2.0 also added with shims for LINQ commands needed.
-
-#### 16.2.1
-- Add FtpListOption.IncludeSelfAndParent to GetListing()
-
-#### 16.1.0
-- Use streams during upload/download of files to improve performance with large files
-
-#### 16.0.18
-- Support for uploading/downloading to Streams and byte[] with UploadFile() and DownloadFile()
-
-#### 16.0.17
-- Added high-level UploadFile() and DownloadFile() API. Fixed some race conditions.
-
-#### 16.0.14
-- Added support for FTP proxies using HTTP 1.1 and User@Host modes. (thanks [L3Z4](https://github.com/L3Z4))
-
-## Credits
-
-- [J.P. Trosclair](https://github.com/jptrosclair) - Original creator, owner upto 2016, FTP/FTPS support, User authentication, Low level upload/download/append API, Basic file management commands, File hashing & checksums
-- [Robin Rodricks](https://github.com/robinrodricks) - Owner and maintainer from 2016 onwards, Nuget package, .NET 2.0 version, .NET core version, documentation (API docs, FTP support table, FAQ), MSBuild automation, High level upload/download API, Reliable chunked file transfer, Byte/stream upload/download API, Multi file upload/download, OS-specific directory listing parsers, Chmod/file permissions, CCC command support, New commands (SetModifiedTime, MoveFile, MoveDirectory), Rewritte DeleteDirectory & FileExists, Server timezone conversion, Hiding sensitive data from logs, Argument validation, Numerous fixes and maintainance
-- [Artiom Chilaru](https://github.com/artiomchi) - Migrate to a single VS 2017 solution, Continuous Integration using AppVeyor, New async methods for UploadFile/DownloadFile/UploadFiles/DownloadFiles, Numerous fixes and improvements for .NET core
-- [Jordan Blacker](https://github.com/jblacker) - `async`/`await` support for all methods, post-transfer hash verification, configurable error handling, multiple log levels
-- [Zhaoquan Huang](https://github.com/taoyouh) - Async methods for .NET Standard, Fixes and improvements
-- [Atif Aziz](https://github.com/atifaziz) & Joseph Albahari - LINQBridge (allows LINQ in .NET 2.0)
-- [R. Harris](https://github.com/rharrisxtheta) - Fixes and improvements
-- [Roberto Sarati](https://github.com/sierrodc) - Fixes and improvements
-- [Amer Koleci](https://github.com/amerkoleci) - Fixes and improvements
-- [Tim Horemans](https://github.com/worstenbrood) - Fixes and improvements
-- [Nerijus Dzindzeleta](https://github.com/NerijusD) - Fixes and improvements
-- [Rune Ibsen](https://github.com/ibsenrune) - Fixes and improvements
-- [Lukazoid](https://github.com/Lukazoid) - Fixes to FtpDataStream

@@ -23,55 +23,7 @@ using System.Threading.Tasks;
 #endif
 
 namespace FluentFTP {
-
-	/// <summary>
-	/// FTP Control Connection. Speaks the FTP protocol with the server and
-	/// provides facilities for performing transactions.
-	/// 
-	/// Debugging problems with FTP transactions is much easier to do when
-	/// you can see exactly what is sent to the server and the reply 
-	/// FluentFTP gets in return. Please review the Debug example
-	/// below for information on how to add <see cref="System.Diagnostics.TraceListener"/>s for capturing
-	/// the conversation between FluentFTP and the server.
-	/// </summary>
-	/// <example>The following example illustrates how to assist in debugging
-	/// FluentFTP by getting a transaction log from the server.
-	/// <code source="..\Examples\Debug.cs" lang="cs" />
-	/// </example>
-	/// <example>The following example demonstrates adding a custom file
-	/// listing parser in the event that you encounter a list format
-	/// not already supported.
-	/// <code source="..\Examples\CustomParser.cs" lang="cs" />
-	/// </example>
-	/// <example>The following example demonstrates how to validate
-	/// a SSL certificate when using SSL/TLS.
-	/// <code source="..\Examples\ValidateCertificate.cs" lang="cs" />
-	/// </example>
-	/// <example>The following example demonstrates how to download a file.
-	/// <code source="..\Examples\OpenRead.cs" lang="cs" />
-	/// </example>
-	/// <example>The following example demonstrates how to download a file
-	/// using a URI object.
-	/// <code source="..\Examples\OpenReadURI.cs" lang="cs" />
-	/// </example>
-	/// <example>The following example demonstrates how to upload a file.
-	/// <code source="..\Examples\OpenWrite.cs" lang="cs" />
-	/// </example>
-	/// <example>The following example demonstrates how to upload a file
-	/// using a URI object.
-	/// <code source="..\Examples\OpenWriteURI.cs" lang="cs" />
-	/// </example>
-	/// <example>The following example demonstrates how to append to a file.
-	/// <code source="..\Examples\OpenAppend.cs" lang="cs" />
-	/// </example>
-	/// <example>The following example demonstrates how to append to a file
-	/// using a URI object.
-	/// <code source="..\Examples\OpenAppendURI.cs" lang="cs" />
-	/// </example>
-	/// <example>The following example demonstrates how to get a file
-	/// listing from the server.
-	/// <code source="..\Examples\GetListing.cs" lang="cs" />
-	/// </example>
+	
 	public partial class FtpClient : IDisposable {
 
 		#region Properties
@@ -124,21 +76,42 @@ namespace FluentFTP {
 			}
 		}
 
-		private bool m_recursiveList = true;
-
 		/// <summary>
-		/// Check if your server supports a recursive LIST command (LIST -R).
-		/// If you know for sure that this is unsupported, set it to false.
+		/// Detect if your FTP server supports the recursive LIST command (LIST -R).
+		/// If you know for sure that this is supported, return true here.
 		/// </summary>
 		public bool RecursiveList {
 			get {
-				if (SystemType.StartsWith("Windows_CE")) {
+
+				// Has support, per https://download.pureftpd.org/pub/pure-ftpd/doc/README
+				if (ServerType == FtpServer.PureFTPd) {
+					return true;
+				}
+
+				// Has support, per: http://www.proftpd.org/docs/howto/ListOptions.html
+				if (ServerType == FtpServer.ProFTPD) {
+					return true;
+				}
+
+				// Has support, but OFF by default, per: https://linux.die.net/man/5/vsftpd.conf
+				if (ServerType == FtpServer.VsFTPd) {
+					return false; // impossible to detect on a server-by-server basis
+				}
+
+				// No support, per: https://trac.filezilla-project.org/ticket/1848
+				if (ServerType == FtpServer.FileZilla) {
 					return false;
 				}
-				return m_recursiveList;
+
+				// No support, per: http://wu-ftpd.therockgarden.ca/man/ftpd.html
+				if (ServerType == FtpServer.WuFTPd) {
+					return false;
+				}
+
+				// Unknown, so assume server does not support recursive listing
+				return false;
 			}
 			set {
-				m_recursiveList = value;
 			}
 		}
 
@@ -194,7 +167,7 @@ namespace FluentFTP {
 			if (path.IsBlank())
 				throw new ArgumentException("Required parameter is null or blank.", "path");
 
-			FtpTrace.WriteFunc("GetObjectInfo", new object[] { path, dateModified });
+			this.LogFunc("GetObjectInfo", new object[] { path, dateModified });
 
 			FtpReply reply;
 			string[] res;
@@ -219,7 +192,7 @@ namespace FluentFTP {
 						result = m_listParser.ParseSingleLine(null, info, m_caps, true);
 					}
 				} else {
-					FtpTrace.WriteStatus(FtpTraceLevel.Warn, "Failed to get object info for path " + path + " with error " + reply.ErrorMessage);
+					this.LogStatus(FtpTraceLevel.Warn, "Failed to get object info for path " + path + " with error " + reply.ErrorMessage);
 				}
 			} else {
 
@@ -235,7 +208,7 @@ namespace FluentFTP {
 					}
 				}
 
-				FtpTrace.WriteStatus(FtpTraceLevel.Warn, "Failed to get object info for path " + path + " since MLST not supported and GetListing() fails to list file/folder.");
+				this.LogStatus(FtpTraceLevel.Warn, "Failed to get object info for path " + path + " since MLST not supported and GetListing() fails to list file/folder.");
 			}
 
 			// Get the accurate date modified using another MDTM command
@@ -269,8 +242,8 @@ namespace FluentFTP {
 			IAsyncResult ar;
 			AsyncGetObjectInfo func;
 
-			ar = (func = new AsyncGetObjectInfo(GetObjectInfo)).BeginInvoke(path, dateModified, callback, state);
 			lock (m_asyncmethods) {
+				ar = (func = new AsyncGetObjectInfo(GetObjectInfo)).BeginInvoke(path, dateModified, callback, state);
 				m_asyncmethods.Add(ar, func);
 			}
 
@@ -364,7 +337,12 @@ namespace FluentFTP {
 		/// <example><code source="..\Examples\GetListing.cs" lang="cs" /></example>
 		public FtpListItem[] GetListing(string path, FtpListOption options) {
 
-			FtpTrace.WriteFunc("GetListing", new object[] { path, options });
+			// start recursive process if needed and unsupported by the server
+			if ((options & FtpListOption.Recursive) == FtpListOption.Recursive && !RecursiveList) {
+				return GetListingRecursive(GetAbsolutePath(path), options);
+			}
+
+			this.LogFunc("GetListing", new object[] { path, options });
 
 			FtpListItem item = null;
 			List<FtpListItem> lst = new List<FtpListItem>();
@@ -426,7 +404,7 @@ namespace FluentFTP {
 				// read in raw file listing
 				using (FtpDataStream stream = OpenDataStream(listcmd, 0)) {
 					try {
-						FtpTrace.WriteLine(FtpTraceLevel.Verbose, "+---------------------------------------+");
+						this.LogLine(FtpTraceLevel.Verbose, "+---------------------------------------+");
 
 						if (this.BulkListing) {
 
@@ -434,7 +412,7 @@ namespace FluentFTP {
 							foreach (var line in stream.ReadAllLines(Encoding, this.BulkListingLength)) {
 								if (!FtpExtensions.IsNullOrWhiteSpace(line)) {
 									rawlisting.Add(line);
-									FtpTrace.WriteLine(FtpTraceLevel.Verbose, "Listing:  " + line);
+									this.LogLine(FtpTraceLevel.Verbose, "Listing:  " + line);
 								}
 							}
 
@@ -444,12 +422,12 @@ namespace FluentFTP {
 							while ((buf = stream.ReadLine(Encoding)) != null) {
 								if (buf.Length > 0) {
 									rawlisting.Add(buf);
-									FtpTrace.WriteLine(FtpTraceLevel.Verbose, "Listing:  " + buf);
+									this.LogLine(FtpTraceLevel.Verbose, "Listing:  " + buf);
 								}
 							}
 						}
 
-						FtpTrace.WriteLine(FtpTraceLevel.Verbose, "-----------------------------------------");
+						this.LogLine(FtpTraceLevel.Verbose, "-----------------------------------------");
 
 					} finally {
 						stream.Close();
@@ -496,7 +474,7 @@ namespace FluentFTP {
 					try {
 						item = m_listParser.ParseSingleLine(path, buf, m_caps, machineList);
 					} catch (FtpListParser.CriticalListParseException) {
-						FtpTrace.WriteStatus(FtpTraceLevel.Verbose, "Restarting parsing from first entry in list");
+						this.LogStatus(FtpTraceLevel.Verbose, "Restarting parsing from first entry in list");
 						i = -1;
 						lst.Clear();
 						continue;
@@ -508,10 +486,10 @@ namespace FluentFTP {
 						if (isIncludeSelf || !(item.Name == "." || item.Name == "..")) {
 							lst.Add(item);
 						} else {
-							//FtpTrace.WriteStatus(FtpTraceLevel.Verbose, "Skipped self or parent item: " + item.Name);
+							//this.LogStatus(FtpTraceLevel.Verbose, "Skipped self or parent item: " + item.Name);
 						}
 					} else {
-						FtpTrace.WriteStatus(FtpTraceLevel.Warn, "Failed to parse file listing: " + buf);
+						this.LogStatus(FtpTraceLevel.Warn, "Failed to parse file listing: " + buf);
 					}
 				}
 
@@ -535,7 +513,7 @@ namespace FluentFTP {
 							DateTime modify;
 
 							if (item.Type == FtpFileSystemObjectType.Directory)
-								FtpTrace.WriteStatus(FtpTraceLevel.Verbose, "Trying to retrieve modification time of a directory, some servers don't like this...");
+								this.LogStatus(FtpTraceLevel.Verbose, "Trying to retrieve modification time of a directory, some servers don't like this...");
 
 							if ((modify = GetModifiedTime(item.FullName)) != DateTime.MinValue)
 								item.Modified = modify;
@@ -614,8 +592,8 @@ namespace FluentFTP {
 			IAsyncResult ar;
 			AsyncGetListing func;
 
-			ar = (func = new AsyncGetListing(GetListing)).BeginInvoke(path, options, callback, state);
 			lock (m_asyncmethods) {
+				ar = (func = new AsyncGetListing(GetListing)).BeginInvoke(path, options, callback, state);
 				m_asyncmethods.Add(ar, func);
 			}
 
@@ -634,23 +612,28 @@ namespace FluentFTP {
 
 #endif
 #if ASYNC
-        /// <summary>
-        /// Gets a file listing from the server asynchronously. Each <see cref="FtpListItem"/> object returned
-        /// contains information about the file that was able to be retrieved. 
-        /// </summary>
-        /// <remarks>
-        /// If a <see cref="DateTime"/> property is equal to <see cref="DateTime.MinValue"/> then it means the 
-        /// date in question was not able to be retrieved. If the <see cref="FtpListItem.Size"/> property
-        /// is equal to 0, then it means the size of the object could also not
-        /// be retrieved.
-        /// </remarks>
-        /// <param name="path">The path to list</param>
-        /// <param name="options">Options that dictate how the list operation is performed</param>
-        /// <returns>An array of items retrieved in the listing</returns>
-        public async Task<FtpListItem[]> GetListingAsync(string path, FtpListOption options)
+		/// <summary>
+		/// Gets a file listing from the server asynchronously. Each <see cref="FtpListItem"/> object returned
+		/// contains information about the file that was able to be retrieved. 
+		/// </summary>
+		/// <remarks>
+		/// If a <see cref="DateTime"/> property is equal to <see cref="DateTime.MinValue"/> then it means the 
+		/// date in question was not able to be retrieved. If the <see cref="FtpListItem.Size"/> property
+		/// is equal to 0, then it means the size of the object could also not
+		/// be retrieved.
+		/// </remarks>
+		/// <param name="path">The path to list</param>
+		/// <param name="options">Options that dictate how the list operation is performed</param>
+		/// <param name="token">Cancellation Token</param>
+		/// <returns>An array of items retrieved in the listing</returns>
+		public async Task<FtpListItem[]> GetListingAsync(string path, FtpListOption options, CancellationToken token = default(CancellationToken))
         {
-            //TODO:  Add cancellation support
-            FtpTrace.WriteFunc(nameof(GetListingAsync), new object[] { path, options });
+			// start recursive process if needed and unsupported by the server
+			if ((options & FtpListOption.Recursive) == FtpListOption.Recursive && !RecursiveList) {
+				return await GetListingRecursiveAsync(GetAbsolutePath(path), options);
+			}
+
+            this.LogFunc(nameof(GetListingAsync), new object[] { path, options });
 
             FtpListItem item = null;
             List<FtpListItem> lst = new List<FtpListItem>();
@@ -671,7 +654,7 @@ namespace FluentFTP {
             bool isGetSize = (options & FtpListOption.Size) == FtpListOption.Size;
 
             // calc path to request
-            path = await GetAbsolutePathAsync(path);
+            path = await GetAbsolutePathAsync(path, token);
 
             // MLSD provides a machine readable format with 100% accurate information
             // so always prefer MLSD over LIST unless the caller of this method overrides it with the ForceList option
@@ -713,25 +696,25 @@ namespace FluentFTP {
                 listcmd = (listcmd + " " + path.GetFtpPath());
             }
 
-            await ExecuteAsync("TYPE I");
+            await ExecuteAsync("TYPE I", token);
 
             // read in raw file listing
-            using (FtpDataStream stream = await OpenDataStreamAsync(listcmd, 0))
+            using (FtpDataStream stream = await OpenDataStreamAsync(listcmd, 0, token))
             {
                 try
                 {
-                    FtpTrace.WriteLine(FtpTraceLevel.Verbose, "+---------------------------------------+");
+                    this.LogLine(FtpTraceLevel.Verbose, "+---------------------------------------+");
 
                     if (this.BulkListing)
                     {
 
                         // increases performance of GetListing by reading multiple lines of the file listing at once
-                        foreach (var line in await stream.ReadAllLinesAsync(Encoding, this.BulkListingLength))
+                        foreach (var line in await stream.ReadAllLinesAsync(Encoding, this.BulkListingLength, token))
                         {
                             if (!FtpExtensions.IsNullOrWhiteSpace(line))
                             {
                                 rawlisting.Add(line);
-                                FtpTrace.WriteLine(FtpTraceLevel.Verbose, "Listing:  " + line);
+                                this.LogLine(FtpTraceLevel.Verbose, "Listing:  " + line);
                             }
                         }
 
@@ -740,17 +723,17 @@ namespace FluentFTP {
                     {
 
                         // GetListing will read file listings line-by-line (actually byte-by-byte)
-                        while ((buf = await stream.ReadLineAsync(Encoding)) != null)
+                        while ((buf = await stream.ReadLineAsync(Encoding, token)) != null)
                         {
                             if (buf.Length > 0)
                             {
                                 rawlisting.Add(buf);
-                                FtpTrace.WriteLine(FtpTraceLevel.Verbose, "Listing:  " + buf);
+                                this.LogLine(FtpTraceLevel.Verbose, "Listing:  " + buf);
                             }
                         }
                     }
 
-                    FtpTrace.WriteLine(FtpTraceLevel.Verbose, "-----------------------------------------");
+                    this.LogLine(FtpTraceLevel.Verbose, "-----------------------------------------");
 
                 }
                 finally
@@ -773,7 +756,7 @@ namespace FluentFTP {
                         FullName = buf
                     };
 
-                    if (await DirectoryExistsAsync(item.FullName))
+                    if (await DirectoryExistsAsync(item.FullName, token))
                         item.Type = FtpFileSystemObjectType.Directory;
                     else
                         item.Type = FtpFileSystemObjectType.File;
@@ -806,7 +789,7 @@ namespace FluentFTP {
                     }
                     catch (FtpListParser.CriticalListParseException)
                     {
-                        FtpTrace.WriteStatus(FtpTraceLevel.Verbose, "Restarting parsing from first entry in list");
+                        this.LogStatus(FtpTraceLevel.Verbose, "Restarting parsing from first entry in list");
                         i = -1;
                         lst.Clear();
                         continue;
@@ -822,12 +805,12 @@ namespace FluentFTP {
                         }
                         else
                         {
-                            //FtpTrace.WriteStatus(FtpTraceLevel.Verbose, "Skipped self or parent item: " + item.Name);
+                            //this.LogStatus(FtpTraceLevel.Verbose, "Skipped self or parent item: " + item.Name);
                         }
                     }
                     else
                     {
-                        FtpTrace.WriteStatus(FtpTraceLevel.Warn, "Failed to parse file listing: " + buf);
+                        this.LogStatus(FtpTraceLevel.Warn, "Failed to parse file listing: " + buf);
                     }
                 }
 
@@ -839,7 +822,7 @@ namespace FluentFTP {
                     // option was passed
                     if (item.Type == FtpFileSystemObjectType.Link && isDerefLinks)
                     {
-                        item.LinkObject = await DereferenceLinkAsync(item);
+                        item.LinkObject = await DereferenceLinkAsync(item, token);
                     }
 
                     // if need to get file modified date
@@ -855,9 +838,9 @@ namespace FluentFTP {
                             DateTime modify;
 
                             if (item.Type == FtpFileSystemObjectType.Directory)
-                                FtpTrace.WriteStatus(FtpTraceLevel.Verbose, "Trying to retrieve modification time of a directory, some servers don't like this...");
+                                this.LogStatus(FtpTraceLevel.Verbose, "Trying to retrieve modification time of a directory, some servers don't like this...");
 
-                            if ((modify = await GetModifiedTimeAsync(item.FullName)) != DateTime.MinValue)
+                            if ((modify = await GetModifiedTimeAsync(item.FullName, token: token)) != DateTime.MinValue)
                                 item.Modified = modify;
                         }
                     }
@@ -872,7 +855,7 @@ namespace FluentFTP {
                         {
                             if (item.Type != FtpFileSystemObjectType.Directory)
                             {
-                                item.Size = await GetFileSizeAsync(item.FullName);
+                                item.Size = await GetFileSizeAsync(item.FullName, token);
                             }
                             else
                             {
@@ -886,21 +869,21 @@ namespace FluentFTP {
             return lst.ToArray();
         }
 
-        /// <summary>
-        /// Gets a file listing from the server asynchronously. Each <see cref="FtpListItem"/> object returned
-        /// contains information about the file that was able to be retrieved. 
-        /// </summary>
-        /// <remarks>
-        /// If a <see cref="DateTime"/> property is equal to <see cref="DateTime.MinValue"/> then it means the 
-        /// date in question was not able to be retrieved. If the <see cref="FtpListItem.Size"/> property
-        /// is equal to 0, then it means the size of the object could also not
-        /// be retrieved.
-        /// </remarks>
-        /// <param name="path">The path to list</param>
-        /// <returns>An array of items retrieved in the listing</returns>
-        public Task<FtpListItem[]> GetListingAsync(string path) {
-            //TODO:  Add cancellation support
-            return GetListingAsync(path, 0);
+		/// <summary>
+		/// Gets a file listing from the server asynchronously. Each <see cref="FtpListItem"/> object returned
+		/// contains information about the file that was able to be retrieved. 
+		/// </summary>
+		/// <remarks>
+		/// If a <see cref="DateTime"/> property is equal to <see cref="DateTime.MinValue"/> then it means the 
+		/// date in question was not able to be retrieved. If the <see cref="FtpListItem.Size"/> property
+		/// is equal to 0, then it means the size of the object could also not
+		/// be retrieved.
+		/// </remarks>
+		/// <param name="path">The path to list</param>
+		/// <param name="token">Cancellation Token</param>
+		/// <returns>An array of items retrieved in the listing</returns>
+		public Task<FtpListItem[]> GetListingAsync(string path, CancellationToken token = default(CancellationToken)) {
+            return GetListingAsync(path, 0, token);
 		}
 
 		/// <summary>
@@ -914,9 +897,106 @@ namespace FluentFTP {
 		/// be retrieved.
 		/// </remarks>
 		/// <returns>An array of items retrieved in the listing</returns>
-		public Task<FtpListItem[]> GetListingAsync() {
-            //TODO:  Add cancellation support
-            return GetListingAsync(null);
+		public Task<FtpListItem[]> GetListingAsync(CancellationToken token = default(CancellationToken)) {
+            return GetListingAsync(null, token);
+		}
+#endif
+
+		#endregion
+
+		#region Get Listing Recursive
+
+		/// <summary>
+		/// Recursive method of GetListing, to recurse through directories on servers that do not natively support recursion.
+		/// Automatically called by GetListing where required.
+		/// Uses flat recursion instead of head recursion.
+		/// </summary>
+		/// <param name="path">The path of the directory to list</param>
+		/// <param name="options">Options that dictacte how a list is performed and what information is gathered.</param>
+		/// <returns>An array of FtpListItem objects</returns>
+		protected FtpListItem[] GetListingRecursive(string path, FtpListOption options) {
+
+			// remove the recursive flag
+			options &= ~FtpListOption.Recursive;
+
+			// add initial path to list of folders to explore
+			Stack<string> stack = new Stack<string>();
+			stack.Push(path);
+			List<FtpListItem> allFiles = new List<FtpListItem>();
+
+			// explore folders
+			while (stack.Count > 0) {
+
+				// get path of folder to list
+				string currentPath = stack.Pop();
+				if (!currentPath.EndsWith("/")) currentPath += "/";
+
+				// list it
+				FtpListItem[] items = GetListing(currentPath, options);
+
+				// add it to the final listing
+				allFiles.AddRange(items);
+
+				// extract the directories
+				foreach (FtpListItem item in items) {
+					if (item.Type == FtpFileSystemObjectType.Directory) {
+						stack.Push(item.FullName);
+					}
+				}
+				items = null;
+
+				// recurse
+			}
+
+			// final list of all files and dirs
+			return allFiles.ToArray();
+		}
+
+#if ASYNC
+		/// <summary>
+		/// Recursive method of GetListingAsync, to recurse through directories on servers that do not natively support recursion.
+		/// Automatically called by GetListingAsync where required.
+		/// Uses flat recursion instead of head recursion.
+		/// </summary>
+		/// <param name="path">The path of the directory to list</param>
+		/// <param name="options">Options that dictacte how a list is performed and what information is gathered.</param>
+		/// <returns>An array of FtpListItem objects</returns>
+		protected async Task<FtpListItem[]> GetListingRecursiveAsync(string path, FtpListOption options) {
+
+			// remove the recursive flag
+			options &= ~FtpListOption.Recursive;
+
+			// add initial path to list of folders to explore
+			Stack<string> stack = new Stack<string>();
+			stack.Push(path);
+			List<FtpListItem> allFiles = new List<FtpListItem>();
+
+			// explore folders
+			while (stack.Count > 0) {
+
+				// get path of folder to list
+				string currentPath = stack.Pop();
+				if (!currentPath.EndsWith("/")) currentPath += "/";
+
+				// list it
+				FtpListItem[] items = await GetListingAsync(currentPath, options);
+
+				// add it to the final listing
+				allFiles.AddRange(items);
+
+				// extract the directories
+				foreach (FtpListItem item in items) {
+					if (item.Type == FtpFileSystemObjectType.Directory) {
+						stack.Push(item.FullName);
+					}
+				}
+				items = null;
+
+				// recurse
+			}
+
+			// final list of all files and dirs
+			return allFiles.ToArray();
 		}
 #endif
 
@@ -940,7 +1020,7 @@ namespace FluentFTP {
 		/// <example><code source="..\Examples\GetNameListing.cs" lang="cs" /></example>
 		public string[] GetNameListing(string path) {
 
-			FtpTrace.WriteFunc("GetNameListing", new object[] { path });
+			this.LogFunc("GetNameListing", new object[] { path });
 
 			List<string> listing = new List<string>();
 
@@ -987,8 +1067,8 @@ namespace FluentFTP {
 			IAsyncResult ar;
 			AsyncGetNameListing func;
 
-			ar = (func = new AsyncGetNameListing(GetNameListing)).BeginInvoke(path, callback, state);
 			lock (m_asyncmethods) {
+				ar = (func = new AsyncGetNameListing(GetNameListing)).BeginInvoke(path, callback, state);
 				m_asyncmethods.Add(ar, func);
 			}
 
@@ -1022,29 +1102,29 @@ namespace FluentFTP {
 		/// Returns a file/directory listing using the NLST command asynchronously
 		/// </summary>
 		/// <param name="path">The path of the directory to list</param>
+		/// <param name="token">Cancellation Token</param>
 		/// <returns>An array of file and directory names if any were returned.</returns>
-		public async Task<string[]> GetNameListingAsync(string path)
+		public async Task<string[]> GetNameListingAsync(string path, CancellationToken token = default(CancellationToken))
 		{
-			//TODO:  Add cancellation support
-			FtpTrace.WriteFunc(nameof(GetNameListingAsync), new object[] { path });
+			this.LogFunc(nameof(GetNameListingAsync), new object[] { path });
 
 			List<string> listing = new List<string>();
 
 			// calc path to request
-			path = await GetAbsolutePathAsync(path);
+			path = await GetAbsolutePathAsync(path, token);
 
 			// always get the file listing in binary
 			// to avoid any potential character translation
 			// problems that would happen if in ASCII.
-			await ExecuteAsync("TYPE I");
+			await ExecuteAsync("TYPE I", token);
 
-			using (FtpDataStream stream = await OpenDataStreamAsync(("NLST " + path.GetFtpPath()), 0))
+			using (FtpDataStream stream = await OpenDataStreamAsync(("NLST " + path.GetFtpPath()), 0, token))
 			{
 				string buf;
 
 				try
 				{
-					while ((buf = await stream.ReadLineAsync(Encoding)) != null)
+					while ((buf = await stream.ReadLineAsync(Encoding, token)) != null)
 						listing.Add(buf);
 				}
 				finally
@@ -1060,9 +1140,8 @@ namespace FluentFTP {
 		/// Returns a file/directory listing using the NLST command asynchronously
 		/// </summary>
 		/// <returns>An array of file and directory names if any were returned.</returns>
-		public Task<string[]> GetNameListingAsync() {
-			//TODO:  Add cancellation support
-			return GetNameListingAsync(null);
+		public Task<string[]> GetNameListingAsync(CancellationToken token = default(CancellationToken)) {
+			return GetNameListingAsync(null, token);
 		}
 #endif
 

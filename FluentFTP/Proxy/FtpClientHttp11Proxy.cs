@@ -1,6 +1,10 @@
 using System;
 using System.IO;
 using System.Text.RegularExpressions;
+using System.Threading;
+#if ASYNC
+using System.Threading.Tasks;
+#endif
 
 namespace FluentFTP.Proxy {
 	/// <summary> A FTP client with a HTTP 1.1 proxy implementation. </summary>
@@ -18,6 +22,9 @@ namespace FluentFTP.Proxy {
 			if (!proxyConnectionReply.Success)
 				throw new FtpException("Can't connect " + Host + " via proxy " + Proxy.Host + ".\nMessage : " +
 										proxyConnectionReply.ErrorMessage);
+
+			// TO TEST: if we are able to detect the actual FTP server software from this reply
+			HandshakeReply = proxyConnectionReply;
 		}
 
 	    /// <summary>
@@ -35,13 +42,24 @@ namespace FluentFTP.Proxy {
 			Connect(stream, Host, Port, FtpIpVersion.ANY);
 		}
 
-        /// <summary>
-        /// Connects to the server using an existing <see cref="FtpSocketStream"/>
-        /// </summary>
-        /// <param name="stream">The existing socket stream</param>
-        /// <param name="host">Host name</param>
-        /// <param name="port">Port number</param>
-        /// <param name="ipVersions">IP version to use</param>
+#if ASYNC
+		/// <summary>
+		/// Connects to the server using an existing <see cref="FtpSocketStream"/>
+		/// </summary>
+		/// <param name="stream">The existing socket stream</param>
+		protected override Task ConnectAsync(FtpSocketStream stream, CancellationToken token)
+		{
+			return ConnectAsync(stream, Host, Port, FtpIpVersion.ANY, token);
+		}
+#endif
+
+		/// <summary>
+		/// Connects to the server using an existing <see cref="FtpSocketStream"/>
+		/// </summary>
+		/// <param name="stream">The existing socket stream</param>
+		/// <param name="host">Host name</param>
+		/// <param name="port">Port number</param>
+		/// <param name="ipVersions">IP version to use</param>
 		protected override void Connect(FtpSocketStream stream, string host, int port, FtpIpVersion ipVersions) {
 			base.Connect(stream);
 
@@ -59,13 +77,51 @@ namespace FluentFTP.Proxy {
 			ProxyHandshake(stream);
 		}
 
+#if ASYNC
+		/// <summary>
+		/// Connects to the server using an existing <see cref="FtpSocketStream"/>
+		/// </summary>
+		/// <param name="stream">The existing socket stream</param>
+		/// <param name="host">Host name</param>
+		/// <param name="port">Port number</param>
+		/// <param name="ipVersions">IP version to use</param>
+		/// <param name="token">IP version to use</param>
+		protected override async Task ConnectAsync(FtpSocketStream stream, string host, int port, FtpIpVersion ipVersions, CancellationToken token)
+		{
+			await base.ConnectAsync(stream,token);
+
+			var writer = new StreamWriter(stream);
+			await writer.WriteLineAsync(string.Format("CONNECT {0}:{1} HTTP/1.1", host, port));
+			await writer.WriteLineAsync(string.Format("Host: {0}:{1}", host, port));
+			if (Proxy.Credentials != null)
+			{
+				var credentialsHash = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(Proxy.Credentials.UserName + ":" + Proxy.Credentials.Password));
+				await writer.WriteLineAsync("Proxy-Authorization: Basic " + credentialsHash);
+			}
+			await writer.WriteLineAsync("User-Agent: custom-ftp-client");
+			await writer.WriteLineAsync();
+			await writer.FlushAsync();
+
+			await ProxyHandshakeAsync(stream, token);
+		}
+#endif
+
 		private void ProxyHandshake(FtpSocketStream stream) {
 			var proxyConnectionReply = GetProxyReply(stream);
 			if (!proxyConnectionReply.Success)
 				throw new FtpException("Can't connect " + Host + " via proxy " + Proxy.Host + ".\nMessage : " + proxyConnectionReply.ErrorMessage);
 		}
-		
-		private FtpReply GetProxyReply( FtpSocketStream stream ) {
+
+#if ASYNC
+		private async Task ProxyHandshakeAsync(FtpSocketStream stream, CancellationToken token = default(CancellationToken))
+		{
+			var proxyConnectionReply = await GetProxyReplyAsync(stream, token);
+			if (!proxyConnectionReply.Success)
+				throw new FtpException("Can't connect " + Host + " via proxy " + Proxy.Host + ".\nMessage : " + proxyConnectionReply.ErrorMessage);
+		}
+#endif
+
+		private FtpReply GetProxyReply( FtpSocketStream stream) {
 			
 			FtpReply reply = new FtpReply();
 			string buf;
@@ -80,7 +136,7 @@ namespace FluentFTP.Proxy {
 				while( ( buf = stream.ReadLine( Encoding ) ) != null ) {
 					Match m;
 					
-					FtpTrace.WriteLine(FtpTraceLevel.Info, buf);
+					this.LogLine(FtpTraceLevel.Info, buf);
 					
 					if( ( m = Regex.Match( buf, @"^HTTP/.*\s(?<code>[0-9]{3}) (?<message>.*)$" ) ).Success ) {
 						reply.Code = m.Groups[ "code" ].Value;
@@ -94,7 +150,7 @@ namespace FluentFTP.Proxy {
 				// fixes #84 (missing bytes when downloading/uploading files through proxy)
 				while( ( buf = stream.ReadLine( Encoding ) ) != null ) {
 
-                    FtpTrace.WriteLine(FtpTraceLevel.Info, buf);
+                    this.LogLine(FtpTraceLevel.Info, buf);
 
 					if (FtpExtensions.IsNullOrWhiteSpace(buf)) {
 						break;
@@ -110,5 +166,48 @@ namespace FluentFTP.Proxy {
 			return reply;
 		}
 
+#if ASYNC
+		private async Task<FtpReply> GetProxyReplyAsync(FtpSocketStream stream, CancellationToken token = default(CancellationToken))
+		{
+			FtpReply reply = new FtpReply();
+			string buf;
+
+			if (!IsConnected)
+				throw new InvalidOperationException("No connection to the server has been established.");
+
+			stream.ReadTimeout = ReadTimeout;
+			while ((buf = await stream.ReadLineAsync(Encoding, token)) != null)
+			{
+				Match m;
+
+				this.LogLine(FtpTraceLevel.Info, buf);
+
+				if ((m = Regex.Match(buf, @"^HTTP/.*\s(?<code>[0-9]{3}) (?<message>.*)$")).Success)
+				{
+					reply.Code = m.Groups["code"].Value;
+					reply.Message = m.Groups["message"].Value;
+					break;
+				}
+
+				reply.InfoMessages += (buf + "\n");
+			}
+
+			// fixes #84 (missing bytes when downloading/uploading files through proxy)
+			while ((buf = await stream.ReadLineAsync(Encoding, token)) != null)
+			{
+
+				this.LogLine(FtpTraceLevel.Info, buf);
+
+				if (FtpExtensions.IsNullOrWhiteSpace(buf))
+				{
+					break;
+				}
+
+				reply.InfoMessages += (buf + "\n");
+			}
+
+			return reply;
+		}
+#endif
 	}
 }

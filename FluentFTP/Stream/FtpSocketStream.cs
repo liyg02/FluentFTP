@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Net.Sockets;
 using System.Net.Security;
@@ -19,6 +19,8 @@ namespace FluentFTP {
 	/// </summary>
 	public class FtpSocketStream : Stream, IDisposable {
 		private SslProtocols m_SslProtocols;
+		public FtpClient Client;
+
 		public FtpSocketStream(SslProtocols defaultSslProtocols) {
 			m_SslProtocols = defaultSslProtocols;
 		}
@@ -96,7 +98,11 @@ namespace FluentFTP {
 					}
 
 					if (m_socketPollInterval > 0 && DateTime.Now.Subtract(m_lastActivity).TotalMilliseconds > m_socketPollInterval) {
-						FtpTrace.WriteStatus(FtpTraceLevel.Verbose, "Testing connectivity using Socket.Poll()...");
+						this.Client.LogStatus(FtpTraceLevel.Verbose, "Testing connectivity using Socket.Poll()...");
+
+						// FIX : #273 update m_lastActivity to the current time
+						m_lastActivity = DateTime.Now;
+
 						if (m_socket.Poll(500000, SelectMode.SelectRead) && m_socket.Available == 0) {
 							Close();
 							return false;
@@ -104,11 +110,11 @@ namespace FluentFTP {
 					}
 				} catch (SocketException sockex) {
 					Close();
-					FtpTrace.WriteStatus(FtpTraceLevel.Warn, "FtpSocketStream.IsConnected: Caught and discarded SocketException while testing for connectivity: " + sockex.ToString());
+					this.Client.LogStatus(FtpTraceLevel.Warn, "FtpSocketStream.IsConnected: Caught and discarded SocketException while testing for connectivity: " + sockex.ToString());
 					return false;
 				} catch (IOException ioex) {
 					Close();
-					FtpTrace.WriteStatus(FtpTraceLevel.Warn, "FtpSocketStream.IsConnected: Caught and discarded IOException while testing for connectivity: " + ioex.ToString());
+					this.Client.LogStatus(FtpTraceLevel.Warn, "FtpSocketStream.IsConnected: Caught and discarded IOException while testing for connectivity: " + ioex.ToString());
 					return false;
 				}
 
@@ -143,6 +149,8 @@ namespace FluentFTP {
 		}
 
 #if !NO_SSL
+		BufferedStream m_bufStream = null;
+
 		SslStream m_sslStream = null;
 		/// <summary>
 		/// The encrypted stream
@@ -256,6 +264,8 @@ namespace FluentFTP {
 			}
 			set {
 				m_readTimeout = value;
+				if (m_netStream != null)
+					m_netStream.ReadTimeout = m_readTimeout;
 			}
 		}
 
@@ -387,20 +397,42 @@ namespace FluentFTP {
 			return read;
 		}
 
+#if ASYNC
+		internal async Task EnableCancellation(Task task, CancellationToken token, Action action)
+		{
+			var registration = token.Register(action);
+			_ = task.ContinueWith(x => registration.Dispose(), CancellationToken.None);
+			await task;
+		}
+
+		internal async Task<T> EnableCancellation<T>(Task<T> task, CancellationToken token, Action action)
+		{
+			var registration = token.Register(action);
+			_ = task.ContinueWith(x => registration.Dispose(), CancellationToken.None);
+			return await task;
+		}
+
+#endif
+
 #if NET45
-        /// <summary>
-        /// Bypass the stream and read directly off the socket.
-        /// </summary>
-        /// <param name="buffer">The buffer to read into</param>
-        /// <returns>The number of bytes read</returns>
-        internal async Task<int> RawSocketReadAsync(byte[] buffer)
+		/// <summary>
+		/// Bypass the stream and read directly off the socket.
+		/// </summary>
+		/// <param name="buffer">The buffer to read into</param>
+		/// <param name="token">Cancellation Token</param>
+		/// <returns>The number of bytes read</returns>
+		internal async Task<int> RawSocketReadAsync(byte[] buffer, CancellationToken token)
         {
             int read = 0;
 
             if (m_socket != null && m_socket.Connected)
             {
                 var asyncResult = m_socket.BeginReceive(buffer, 0, buffer.Length, 0, null, null);
-                read = await Task.Factory.FromAsync(asyncResult, m_socket.EndReceive);
+                read = await EnableCancellation(
+	                Task.Factory.FromAsync(asyncResult, m_socket.EndReceive),
+	                token,
+	                () => m_socket.Close()
+	            );
             }
 
             return read;
@@ -413,11 +445,11 @@ namespace FluentFTP {
         /// </summary>
         /// <param name="buffer">The buffer to read into</param>
         /// <returns>The number of bytes read</returns>
-        internal async Task<int> RawSocketReadAsync(byte[] buffer)
+        internal async Task<int> RawSocketReadAsync(byte[] buffer, CancellationToken token)
         {
             int read = 0;
 
-            if (m_socket != null && m_socket.Connected)
+            if (m_socket != null && m_socket.Connected && !token.IsCancellationRequested)
             {
                 read = await m_socket.ReceiveAsync(new ArraySegment<byte>(buffer), 0);
             }
@@ -443,7 +475,7 @@ namespace FluentFTP {
 
 			m_lastActivity = DateTime.Now;
 #if CORE
-			return BaseStream.ReadAsync(buffer, offset, count).Result;
+			return BaseStream.Read(buffer, offset, count);
 #else
 			ar = BaseStream.BeginRead(buffer, offset, count, null, null);
 			if (!ar.AsyncWaitHandle.WaitOne(m_readTimeout, true)) {
@@ -469,8 +501,35 @@ namespace FluentFTP {
 				return 0;
 
 			m_lastActivity = DateTime.Now;
-			return await BaseStream.ReadAsync(buffer, offset, count, token);
+			using (var cts = CancellationTokenSource.CreateLinkedTokenSource(token))
+			{
+				cts.CancelAfter(this.ReadTimeout);
+				cts.Token.Register(() => this.Close());
+				try
+				{
+					var res =  await BaseStream.ReadAsync(buffer, offset, count, cts.Token);
+					return res;
+				}
+				catch
+				{
+					// CTS for Cancellation triggered and caused the exception
+					if (token.IsCancellationRequested)
+					{
+						throw new OperationCanceledException("Cancelled read from socket stream");
+					}
+
+					// CTS for Timeout triggered and caused the exception
+					if (cts.IsCancellationRequested)
+					{
+						throw new TimeoutException("Timed out trying to read data from the socket stream!");
+					}
+
+					// Nothing of the above. So we rethrow the exception.
+					throw;
+				}
+			}
 		}
+
 #endif
 
 		/// <summary>
@@ -550,29 +609,20 @@ namespace FluentFTP {
 			return line;
 		}
 
-		/// <summary>
-		/// Reads a line from the socket asynchronously
-		/// </summary>
-		/// <param name="encoding">The type of encoding used to convert from byte[] to string</param>
-		/// <returns>A line from the stream, null if there is nothing to read</returns>
-		public async Task<string> ReadLineAsync(System.Text.Encoding encoding) {
-			return await ReadLineAsync(encoding, CancellationToken.None);
-		}
-
         /// <summary>
         /// Reads all line from the socket
         /// </summary>
         /// <param name="encoding">The type of encoding used to convert from byte[] to string</param>
         /// <param name="bufferSize">The size of the buffer</param>
         /// <returns>A list of lines from the stream</returns>
-        public async Task<IEnumerable<string>> ReadAllLinesAsync(System.Text.Encoding encoding, int bufferSize)
+        public async Task<IEnumerable<string>> ReadAllLinesAsync(System.Text.Encoding encoding, int bufferSize, CancellationToken token)
         {
             int charRead;
             List<byte> data = new List<byte>();
             List<string> lines = new List<string>();
             byte[] buf = new byte[bufferSize];
 
-            while ((charRead = await ReadAsync(buf, 0, buf.Length)) > 0)
+            while ((charRead = await ReadAsync(buf, 0, buf.Length, token)) > 0)
             {
                 var firstByteToReadIdx = 0;
 
@@ -651,22 +701,13 @@ namespace FluentFTP {
 			byte[] data = encoding.GetBytes(buf + "\r\n");
 			await WriteAsync(data, 0, data.Length, token);
 		}
-
-		/// <summary>
-		/// Writes a line to the stream using the specified encoding asynchronously
-		/// </summary>
-		/// <param name="encoding">Encoding used for writing the line</param>
-		/// <param name="buf">The data to write</param>
-		public async Task WriteLineAsync(System.Text.Encoding encoding, string buf) {
-			await WriteLineAsync(encoding, buf, CancellationToken.None);
-		}
 #endif
 
 #if CORE
 		/// <summary>
 		/// Disconnects from server
 		/// </summary>
-		public void Close()
+		public virtual void Close()
 		{
 			Dispose(true);
 		}
@@ -676,7 +717,16 @@ namespace FluentFTP {
 		/// Disconnects from server
 		/// </summary>
 		protected override void Dispose(bool disposing) {
-			FtpTrace.WriteStatus(FtpTraceLevel.Verbose, "Disposing FtpSocketStream...");
+			this.Client.LogStatus(FtpTraceLevel.Verbose, "Disposing FtpSocketStream...");
+
+#if !NO_SSL
+			if (m_bufStream != null) {
+				// ensure the last of the buffered bytes are flushed
+				// before we close the socket and network stream
+				m_bufStream.Flush();
+			}
+#endif
+
 			if (m_socket != null) {
 				try {
 					if (m_socket.Connected) {
@@ -695,7 +745,7 @@ namespace FluentFTP {
                     m_socket.Dispose();
 #endif
 				} catch (SocketException ex) {
-					FtpTrace.WriteStatus(FtpTraceLevel.Warn, "Caught and discarded a SocketException while cleaning up the Socket: " + ex.ToString());
+					this.Client.LogStatus(FtpTraceLevel.Warn, "Caught and discarded a SocketException while cleaning up the Socket: " + ex.ToString());
 				} finally {
 					m_socket = null;
 				}
@@ -705,7 +755,7 @@ namespace FluentFTP {
 				try {
 					m_netStream.Dispose();
 				} catch (IOException ex) {
-					FtpTrace.WriteStatus(FtpTraceLevel.Warn, "Caught and discarded an IOException while cleaning up the NetworkStream: " + ex.ToString());
+					this.Client.LogStatus(FtpTraceLevel.Warn, "Caught and discarded an IOException while cleaning up the NetworkStream: " + ex.ToString());
 				} finally {
 					m_netStream = null;
 				}
@@ -716,9 +766,19 @@ namespace FluentFTP {
 				try {
 					m_sslStream.Dispose();
 				} catch (IOException ex) {
-					FtpTrace.WriteStatus(FtpTraceLevel.Warn, "Caught and discarded an IOException while cleaning up the SslStream: " + ex.ToString());
+					this.Client.LogStatus(FtpTraceLevel.Warn, "Caught and discarded an IOException while cleaning up the SslStream: " + ex.ToString());
 				} finally {
 					m_sslStream = null;
+				}
+			}
+
+			if (m_bufStream != null) {
+				try {
+					m_bufStream.Dispose();
+				} catch (IOException ex) {
+					this.Client.LogStatus(FtpTraceLevel.Warn, "Caught and discarded an IOException while cleaning up the BufferedStream: " + ex.ToString());
+				} finally {
+					m_bufStream = null;
 				}
 			}
 #endif
@@ -762,7 +822,7 @@ namespace FluentFTP {
 						case AddressFamily.InterNetwork:
 							if ((ipVersions & FtpIpVersion.IPv4) != FtpIpVersion.IPv4) {
 #if DEBUG
-								FtpTrace.WriteStatus(FtpTraceLevel.Verbose, "Skipped IPV4 address : " + addresses[i].ToString());
+								this.Client.LogStatus(FtpTraceLevel.Verbose, "Skipped IPV4 address : " + addresses[i].ToString());
 #endif
 								continue;
 							}
@@ -770,7 +830,7 @@ namespace FluentFTP {
 						case AddressFamily.InterNetworkV6:
 							if ((ipVersions & FtpIpVersion.IPv6) != FtpIpVersion.IPv6) {
 #if DEBUG
-								FtpTrace.WriteStatus(FtpTraceLevel.Verbose, "Skipped IPV6 address : " + addresses[i].ToString());
+								this.Client.LogStatus(FtpTraceLevel.Verbose, "Skipped IPV6 address : " + addresses[i].ToString());
 #endif
 								continue;
 							}
@@ -779,9 +839,9 @@ namespace FluentFTP {
 				}
 
 				if (FtpTrace.LogIP) {
-					FtpTrace.WriteStatus(FtpTraceLevel.Info, "Connecting to " + addresses[i].ToString() + ":" + port);
+					this.Client.LogStatus(FtpTraceLevel.Info, "Connecting to " + addresses[i].ToString() + ":" + port);
 				} else {
-					FtpTrace.WriteStatus(FtpTraceLevel.Info, "Connecting to ***:" + port);
+					this.Client.LogStatus(FtpTraceLevel.Info, "Connecting to ***:" + port);
 				}
 
 				m_socket = new Socket(addresses[i].AddressFamily, SocketType.Stream, ProtocolType.Tcp);
@@ -814,17 +874,19 @@ namespace FluentFTP {
 			}
 
 			m_netStream = new NetworkStream(m_socket);
+			m_netStream.ReadTimeout = m_readTimeout;
 			m_lastActivity = DateTime.Now;
 		}
 
 #if ASYNC
-        /// <summary>
-        /// Connect to the specified host
-        /// </summary>
-        /// <param name="host">The host to connect to</param>
-        /// <param name="port">The port to connect to</param>
-        /// <param name="ipVersions">Internet Protocol versions to support during the connection phase</param>
-        public async Task ConnectAsync(string host, int port, FtpIpVersion ipVersions)
+		/// <summary>
+		/// Connect to the specified host
+		/// </summary>
+		/// <param name="host">The host to connect to</param>
+		/// <param name="port">The port to connect to</param>
+		/// <param name="ipVersions">Internet Protocol versions to support during the connection phase</param>
+		/// <param name="token">Cancellation Token</param>
+		public async Task ConnectAsync(string host, int port, FtpIpVersion ipVersions, CancellationToken token)
         {
             IPAddress[] addresses = await Dns.GetHostAddressesAsync(host);
 
@@ -844,7 +906,7 @@ namespace FluentFTP {
                             if ((ipVersions & FtpIpVersion.IPv4) != FtpIpVersion.IPv4)
                             {
 #if DEBUG
-                                FtpTrace.WriteStatus(FtpTraceLevel.Verbose, "Skipped IPV4 address : " + addresses[i].ToString());
+                                this.Client.LogStatus(FtpTraceLevel.Verbose, "Skipped IPV4 address : " + addresses[i].ToString());
 #endif
                                 continue;
                             }
@@ -853,7 +915,7 @@ namespace FluentFTP {
                             if ((ipVersions & FtpIpVersion.IPv6) != FtpIpVersion.IPv6)
                             {
 #if DEBUG
-                                FtpTrace.WriteStatus(FtpTraceLevel.Verbose, "Skipped IPV6 address : " + addresses[i].ToString());
+                                this.Client.LogStatus(FtpTraceLevel.Verbose, "Skipped IPV6 address : " + addresses[i].ToString());
 #endif
                                 continue;
                             }
@@ -863,21 +925,20 @@ namespace FluentFTP {
 
                 if (FtpTrace.LogIP)
                 {
-                    FtpTrace.WriteStatus(FtpTraceLevel.Info, "Connecting to " + addresses[i].ToString() + ":" + port);
+                    this.Client.LogStatus(FtpTraceLevel.Info, "Connecting to " + addresses[i].ToString() + ":" + port);
                 }
                 else
                 {
-                    FtpTrace.WriteStatus(FtpTraceLevel.Info, "Connecting to ***:" + port);
+                    this.Client.LogStatus(FtpTraceLevel.Info, "Connecting to ***:" + port);
                 }
 
                 m_socket = new Socket(addresses[i].AddressFamily, SocketType.Stream, ProtocolType.Tcp);
-
 #if CORE
-                await m_socket.ConnectAsync(addresses[i], port);
+                await EnableCancellation(m_socket.ConnectAsync(addresses[i], port), token, () => m_socket.Dispose());
                 break;
 #else
-                var connectResult = m_socket.BeginConnect(addresses[i], port, null, null);
-                await Task.Factory.FromAsync(connectResult, m_socket.EndConnect);
+				var connectResult = m_socket.BeginConnect(addresses[i], port, null, null);
+                await EnableCancellation(Task.Factory.FromAsync(connectResult, m_socket.EndConnect), token, () => m_socket.Close());
                 break;
 #endif
             }
@@ -891,6 +952,7 @@ namespace FluentFTP {
             }
 
             m_netStream = new NetworkStream(m_socket);
+            m_netStream.ReadTimeout = m_readTimeout;
             m_lastActivity = DateTime.Now;
         }
 #endif
@@ -967,14 +1029,16 @@ namespace FluentFTP {
 				DateTime auth_start;
 				TimeSpan auth_time_total;
 
+				m_bufStream = new BufferedStream(NetworkStream, 81920);
+
 #if CORE
-				m_sslStream = new SslStream(NetworkStream, true, new RemoteCertificateValidationCallback(
+				m_sslStream = new SslStream(m_bufStream, true, new RemoteCertificateValidationCallback(
 					delegate(object sender, X509Certificate certificate, X509Chain chain, SslPolicyErrors sslPolicyErrors) {
 						return OnValidateCertificate(certificate, chain, sslPolicyErrors);
 					}
 				));
 #else
-				m_sslStream = new FtpSslStream(NetworkStream, true, new RemoteCertificateValidationCallback(
+				m_sslStream = new FtpSslStream(m_bufStream, true, new RemoteCertificateValidationCallback(
 					delegate (object sender, X509Certificate certificate, X509Chain chain, SslPolicyErrors sslPolicyErrors) {
 						return OnValidateCertificate(certificate, chain, sslPolicyErrors);
 					}
@@ -989,15 +1053,15 @@ namespace FluentFTP {
 #endif
 
 				auth_time_total = DateTime.Now.Subtract(auth_start);
-				FtpTrace.WriteStatus(FtpTraceLevel.Info, "FTPS Authentication Successful");
-				FtpTrace.WriteStatus(FtpTraceLevel.Verbose, "Time to activate encryption: " + auth_time_total.Hours + "h " + auth_time_total.Minutes + "m " + auth_time_total.Seconds + "s.  Total Seconds: " + auth_time_total.TotalSeconds + ".");
+				this.Client.LogStatus(FtpTraceLevel.Info, "FTPS Authentication Successful");
+				this.Client.LogStatus(FtpTraceLevel.Verbose, "Time to activate encryption: " + auth_time_total.Hours + "h " + auth_time_total.Minutes + "m " + auth_time_total.Seconds + "s.  Total Seconds: " + auth_time_total.TotalSeconds + ".");
 			} catch (AuthenticationException) {
 				// authentication failed and in addition it left our 
 				// ssl stream in an unusable state so cleanup needs
 				// to be done and the exception can be re-thrown for
 				// handling down the chain. (Add logging?)
 				Close();
-				FtpTrace.WriteStatus(FtpTraceLevel.Error, "FTPS Authentication Failed");
+				this.Client.LogStatus(FtpTraceLevel.Error, "FTPS Authentication Failed");
 				throw;
 			}
 		}
@@ -1028,14 +1092,16 @@ namespace FluentFTP {
                 DateTime auth_start;
                 TimeSpan auth_time_total;
 
+	            m_bufStream = new BufferedStream(NetworkStream, 81920);
+
 #if CORE
-				m_sslStream = new SslStream(NetworkStream, true, new RemoteCertificateValidationCallback(
+				m_sslStream = new SslStream(m_bufStream, true, new RemoteCertificateValidationCallback(
 					delegate(object sender, X509Certificate certificate, X509Chain chain, SslPolicyErrors sslPolicyErrors) {
 						return OnValidateCertificate(certificate, chain, sslPolicyErrors);
 					}
 				));
 #else
-                m_sslStream = new FtpSslStream(NetworkStream, true, new RemoteCertificateValidationCallback(
+                m_sslStream = new FtpSslStream(m_bufStream, true, new RemoteCertificateValidationCallback(
                     delegate (object sender, X509Certificate certificate, X509Chain chain, SslPolicyErrors sslPolicyErrors)
                     {
                         return OnValidateCertificate(certificate, chain, sslPolicyErrors);
@@ -1047,8 +1113,8 @@ namespace FluentFTP {
                 await m_sslStream.AuthenticateAsClientAsync(targethost, clientCerts, sslProtocols, true);
 
                 auth_time_total = DateTime.Now.Subtract(auth_start);
-                FtpTrace.WriteStatus(FtpTraceLevel.Info, "FTPS Authentication Successful");
-                FtpTrace.WriteStatus(FtpTraceLevel.Verbose, "Time to activate encryption: " + auth_time_total.Hours + "h " + auth_time_total.Minutes + "m " + auth_time_total.Seconds + "s.  Total Seconds: " + auth_time_total.TotalSeconds + ".");
+                this.Client.LogStatus(FtpTraceLevel.Info, "FTPS Authentication Successful");
+                this.Client.LogStatus(FtpTraceLevel.Verbose, "Time to activate encryption: " + auth_time_total.Hours + "h " + auth_time_total.Minutes + "m " + auth_time_total.Seconds + "s.  Total Seconds: " + auth_time_total.TotalSeconds + ".");
             }
             catch (AuthenticationException)
             {
@@ -1057,7 +1123,7 @@ namespace FluentFTP {
                 // to be done and the exception can be re-thrown for
                 // handling down the chain. (Add logging?)
                 Close();
-                FtpTrace.WriteStatus(FtpTraceLevel.Error, "FTPS Authentication Failed");
+                this.Client.LogStatus(FtpTraceLevel.Error, "FTPS Authentication Failed");
                 throw;
             }
         }
@@ -1127,6 +1193,7 @@ namespace FluentFTP {
                 m_socket = await m_socket.AcceptAsync();
 #if CORE
 				m_netStream = new NetworkStream(m_socket);
+				m_netStream.ReadTimeout = m_readTimeout;
 #endif
 			}
 		}
@@ -1151,6 +1218,7 @@ namespace FluentFTP {
 			if (m_socket != null) {
 				m_socket = m_socket.EndAccept(ar);
 				m_netStream = new NetworkStream(m_socket);
+				m_netStream.ReadTimeout = m_readTimeout;
 			}
 		}
 #endif
